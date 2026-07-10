@@ -48,6 +48,12 @@ class BybitClient:
         rounded = round(qty / step) * step
         return max(rounded, min_qty)
 
+    def _fmt_qty(self, symbol: str, qty: float) -> str:
+        info = self.get_instrument_info(symbol)
+        step = float(info["lotSizeFilter"]["qtyStep"])
+        decimals = max(0, str(step)[::-1].find("."))
+        return f"{qty:.{decimals}f}"
+
     def round_price(self, symbol: str, price: float) -> float:
         symbol = self._norm(symbol)
         info = self.get_instrument_info(symbol)
@@ -55,6 +61,12 @@ class BybitClient:
         decimals = max(0, str(tick)[::-1].find("."))
         rounded = round(price / tick) * tick
         return round(rounded, decimals)
+
+    def _fmt_price(self, symbol: str, price: float) -> str:
+        info = self.get_instrument_info(symbol)
+        tick = float(info["priceFilter"]["tickSize"])
+        decimals = max(0, str(tick)[::-1].find("."))
+        return f"{price:.{decimals}f}"
 
     # ---------- position / leverage setup ----------
 
@@ -113,14 +125,14 @@ class BybitClient:
         symbol = self._norm(symbol)
         return self.http.place_order(
             category=self.category, symbol=symbol, side=side,
-            orderType="Market", qty=str(qty), reduceOnly=reduce_only,
+            orderType="Market", qty=self._fmt_qty(symbol, qty), reduceOnly=reduce_only,
         )
 
     def place_limit_order(self, symbol: str, side: str, qty: float, price: float, reduce_only=False):
         symbol = self._norm(symbol)
         return self.http.place_order(
             category=self.category, symbol=symbol, side=side,
-            orderType="Limit", qty=str(qty), price=str(price),
+            orderType="Limit", qty=self._fmt_qty(symbol, qty), price=self._fmt_price(symbol, price),
             timeInForce="GTC", reduceOnly=reduce_only,
         )
 
@@ -130,8 +142,8 @@ class BybitClient:
         # triggerBy=MarkPrice avoids the SL firing on thin-orderbook last-price wicks
         return self.http.place_order(
             category=self.category, symbol=symbol, side=side,
-            orderType="Market", qty=str(qty),
-            triggerPrice=str(trigger_price), triggerDirection=1 if side == "Sell" else 2,
+            orderType="Market", qty=self._fmt_qty(symbol, qty),
+            triggerPrice=self._fmt_price(symbol, trigger_price), triggerDirection=1 if side == "Sell" else 2,
             triggerBy="MarkPrice",
             reduceOnly=True, closeOnTrigger=True,
         )
