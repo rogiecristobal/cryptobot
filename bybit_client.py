@@ -74,7 +74,6 @@ class BybitClient:
 
     def set_margin_mode(self, symbol: str, mode: str):
         symbol = self._norm(symbol)
-        # mode: "ISOLATED" or "CROSS" (Bybit param: tradeMode 1=isolated, 0=cross)
         trade_mode = 1 if mode.upper() == "ISOLATED" else 0
         try:
             self.http.switch_margin_mode(
@@ -85,8 +84,13 @@ class BybitClient:
                 sellLeverage=str(config.DEFAULT_LEVERAGE),
             )
         except Exception as e:
-            if "not modified" not in str(e).lower():
-                raise
+            msg = str(e).lower()
+            if "unified account is forbidden" in msg:
+                log.warning("UTA account detected — margin mode is set at account level, skipping switch.")
+                return
+            if "not modified" in msg:
+                return
+            raise
 
     def get_open_position(self, symbol: str) -> dict | None:
         symbol = self._norm(symbol)
