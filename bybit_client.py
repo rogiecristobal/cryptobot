@@ -19,6 +19,9 @@ class BybitClient:
         self.category = config.BYBIT_CATEGORY
         self._instrument_cache = {}
 
+    def _norm(self, symbol: str) -> str:
+        return symbol.replace("/", "").replace(" ", "")
+
     # ---------- account / instrument info ----------
 
     def get_equity_usdt(self) -> float:
@@ -29,6 +32,7 @@ class BybitClient:
             raise RuntimeError(f"Could not parse equity from wallet response: {resp}")
 
     def get_instrument_info(self, symbol: str) -> dict:
+        symbol = self._norm(symbol)
         if symbol in self._instrument_cache:
             return self._instrument_cache[symbol]
         resp = self.http.get_instruments_info(category=self.category, symbol=symbol)
@@ -37,6 +41,7 @@ class BybitClient:
         return info
 
     def round_qty(self, symbol: str, qty: float) -> float:
+        symbol = self._norm(symbol)
         info = self.get_instrument_info(symbol)
         step = float(info["lotSizeFilter"]["qtyStep"])
         min_qty = float(info["lotSizeFilter"]["minOrderQty"])
@@ -44,6 +49,7 @@ class BybitClient:
         return max(rounded, min_qty)
 
     def round_price(self, symbol: str, price: float) -> float:
+        symbol = self._norm(symbol)
         info = self.get_instrument_info(symbol)
         tick = float(info["priceFilter"]["tickSize"])
         decimals = max(0, str(tick)[::-1].find("."))
@@ -53,6 +59,7 @@ class BybitClient:
     # ---------- position / leverage setup ----------
 
     def set_leverage(self, symbol: str, leverage: int):
+        symbol = self._norm(symbol)
         try:
             self.http.set_leverage(
                 category=self.category,
@@ -66,6 +73,7 @@ class BybitClient:
                 raise
 
     def set_margin_mode(self, symbol: str, mode: str):
+        symbol = self._norm(symbol)
         # mode: "ISOLATED" or "CROSS" (Bybit param: tradeMode 1=isolated, 0=cross)
         trade_mode = 1 if mode.upper() == "ISOLATED" else 0
         try:
@@ -81,6 +89,7 @@ class BybitClient:
                 raise
 
     def get_open_position(self, symbol: str) -> dict | None:
+        symbol = self._norm(symbol)
         resp = self.http.get_positions(category=self.category, symbol=symbol)
         for pos in resp["result"]["list"]:
             if float(pos.get("size", 0)) > 0:
@@ -88,6 +97,7 @@ class BybitClient:
         return None
 
     def has_open_orders_or_position(self, symbol: str) -> bool:
+        symbol = self._norm(symbol)
         if self.get_open_position(symbol):
             return True
         resp = self.http.get_open_orders(category=self.category, symbol=symbol)
@@ -96,12 +106,14 @@ class BybitClient:
     # ---------- orders ----------
 
     def place_market_order(self, symbol: str, side: str, qty: float, reduce_only=False):
+        symbol = self._norm(symbol)
         return self.http.place_order(
             category=self.category, symbol=symbol, side=side,
             orderType="Market", qty=str(qty), reduceOnly=reduce_only,
         )
 
     def place_limit_order(self, symbol: str, side: str, qty: float, price: float, reduce_only=False):
+        symbol = self._norm(symbol)
         return self.http.place_order(
             category=self.category, symbol=symbol, side=side,
             orderType="Limit", qty=str(qty), price=str(price),
@@ -109,6 +121,7 @@ class BybitClient:
         )
 
     def place_stop_loss(self, symbol: str, side: str, qty: float, trigger_price: float):
+        symbol = self._norm(symbol)
         # side here is the CLOSING side (opposite of position side)
         # triggerBy=MarkPrice avoids the SL firing on thin-orderbook last-price wicks
         return self.http.place_order(
@@ -120,15 +133,18 @@ class BybitClient:
         )
 
     def cancel_order(self, symbol: str, order_id: str):
+        symbol = self._norm(symbol)
         try:
             self.http.cancel_order(category=self.category, symbol=symbol, orderId=order_id)
         except Exception as e:
             log.warning(f"Cancel failed for {order_id} ({symbol}): {e}")
 
     def cancel_all(self, symbol: str):
+        symbol = self._norm(symbol)
         self.http.cancel_all_orders(category=self.category, symbol=symbol)
 
     def close_position_market(self, symbol: str, side: str, qty: float):
+        symbol = self._norm(symbol)
         return self.place_market_order(symbol, side, qty, reduce_only=True)
 
     # ---------- websocket (fills / position updates) ----------
