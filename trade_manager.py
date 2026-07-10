@@ -116,7 +116,11 @@ class TradeManager:
             breakeven_moved=0,
             raw_signal=signal.asset,
         )
-        return f"Placed entry{' + DCA' if dca_order_id else ''} for {symbol}. Waiting for fill to arm SL/TPs."
+
+        if signal.entry_is_market:
+            self.sync_protective_orders(symbol)
+            return f"Market entry filled for {symbol}. SL/TPs armed."
+        return f"Limit entry placed for {symbol}. Waiting for fill to arm SL/TPs."
 
     def cancel(self, symbol: str) -> str:
         self.pending.pop(symbol, None)
