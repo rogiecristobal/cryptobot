@@ -31,7 +31,15 @@ async def _stage_and_reply(update: Update, trade_manager, text: str):
 def build_app(manager_ref):
     """manager_ref is an object with a `.tm` attribute holding the TradeManager,
     set by the caller after the bot (and therefore notify()) exists."""
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .get_updates_connect_timeout(30)
+        .get_updates_read_timeout(30)
+        .build()
+    )
  
     async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _authorized(update):
