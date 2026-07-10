@@ -20,7 +20,7 @@ class TradeManager:
         self.bybit = bybit
         self.db = db
         self.notify = notify  # async-callable(str) -> sends a Telegram message
-        self.pending = {}     # symbol -> (ParsedSignal, expiry_timestamp)
+        self.pending = {}     # symbol -> dict(signal, expiry, chat_id, message_id)
  
     # ---------- stage 1: validate + queue for confirmation ----------
  
@@ -34,11 +34,11 @@ class TradeManager:
             raise ValueError(f"{symbol} already has an open position or pending order — new signal rejected.")
  
         expiry = time.time() + config.CONFIRM_TIMEOUT_SECONDS
-        self.pending[symbol] = (signal, expiry)
+        self.pending[symbol] = {"signal": signal, "expiry": expiry, "chat_id": None, "message_id": None}
  
         qty_entry, qty_dca = self._calc_qty(signal)
         lines = [
-            f"⚠️ Confirm trade — reply ✅ within {config.CONFIRM_TIMEOUT_SECONDS}s",
+            f"⚠️ Confirm trade — tap below within {config.CONFIRM_TIMEOUT_SECONDS}s",
             f"{symbol} ({signal.position})",
             f"Entry: {'MARKET' if signal.entry_is_market else signal.entry}  (qty ~{qty_entry})",
         ]
@@ -78,8 +78,8 @@ class TradeManager:
         entry = self.pending.pop(symbol, None)
         if not entry:
             return f"No pending confirmation for {symbol} (expired or never staged)."
-        signal, expiry = entry
-        if time.time() > expiry:
+        signal = entry["signal"]
+        if time.time() > entry["expiry"]:
             return f"Confirmation window for {symbol} expired — resend the signal."
  
         qty_entry, qty_dca = self._calc_qty(signal)
@@ -117,7 +117,11 @@ class TradeManager:
             raw_signal=signal.asset,
         )
         return f"Placed entry{' + DCA' if dca_order_id else ''} for {symbol}. Waiting for fill to arm SL/TPs."
- 
+
+    def cancel(self, symbol: str) -> str:
+        self.pending.pop(symbol, None)
+        return f"Trade for {symbol} cancelled."
+
     # ---------- stage 3: fill-driven protective order management ----------
  
     def sync_protective_orders(self, symbol: str):
