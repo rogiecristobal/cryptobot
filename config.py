@@ -26,4 +26,6 @@ DEFAULT_MARGIN_MODE = os.getenv("DEFAULT_MARGIN_MODE", "ISOLATED").upper()
 
 CONFIRM_TIMEOUT_SECONDS = int(os.getenv("CONFIRM_TIMEOUT_SECONDS", "120"))
 
+PRICE_MULTIPLIER = float(os.getenv("PRICE_MULTIPLIER", "1"))
+
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "trades.db")

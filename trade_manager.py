@@ -32,7 +32,19 @@ class TradeManager:
         symbol = signal.asset
         if self.bybit.has_open_orders_or_position(symbol):
             raise ValueError(f"{symbol} already has an open position or pending order — new signal rejected.")
- 
+
+        m = config.PRICE_MULTIPLIER
+        if m != 1:
+            if signal.entry is not None:
+                signal.entry *= m
+            if signal.dca is not None:
+                signal.dca *= m
+            if signal.sl is not None:
+                signal.sl *= m
+            signal.tps = [p * m for p in signal.tps]
+            if signal.entry_range:
+                signal.entry_range = [p * m for p in signal.entry_range]
+
         expiry = time.time() + config.CONFIRM_TIMEOUT_SECONDS
         self.pending[symbol] = {"signal": signal, "expiry": expiry, "chat_id": None, "message_id": None}
  
