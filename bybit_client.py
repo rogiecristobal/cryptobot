@@ -110,10 +110,12 @@ class BybitClient:
 
     def place_stop_loss(self, symbol: str, side: str, qty: float, trigger_price: float):
         # side here is the CLOSING side (opposite of position side)
+        # triggerBy=MarkPrice avoids the SL firing on thin-orderbook last-price wicks
         return self.http.place_order(
             category=self.category, symbol=symbol, side=side,
             orderType="Market", qty=str(qty),
             triggerPrice=str(trigger_price), triggerDirection=1 if side == "Sell" else 2,
+            triggerBy="MarkPrice",
             reduceOnly=True, closeOnTrigger=True,
         )
 
