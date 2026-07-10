@@ -34,7 +34,7 @@ class BybitClient:
     def get_instrument_info(self, symbol: str) -> dict:
         symbol = self._norm(symbol)
         if symbol in self._instrument_cache: 
-            return self._instrument_cache[symbol]
+            return self._instrument_cache[symbol] 
         resp = self.http.get_instruments_info(category=self.category, symbol=symbol)
         info = resp["result"]["list"][0]
         self._instrument_cache[symbol] = info
