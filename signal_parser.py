@@ -86,7 +86,7 @@ def parse_signal(text: str) -> ParsedSignal:
     m = re.search(r"entr(?:y|ies)" + SEP + r"([^\n\r]+)", text, re.IGNORECASE)
     if m:
         val = m.group(1).strip()
-        if re.search(r"market", val, re.IGNORECASE):
+        if re.search(r"market|now|current", val, re.IGNORECASE):
             data.entry_is_market = True
         else:
             nums = _all_nums(val)
