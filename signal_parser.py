@@ -77,7 +77,8 @@ def parse_signal(text: str) -> ParsedSignal:
     elif re.search(r"\blong\b", text, re.IGNORECASE):
         data.position = "LONG"
 
-    m = re.search(r"entr(?:y|ies)[:\s]+([^\n\r]+)", text, re.IGNORECASE)
+    SEP = r"[:.\s]+"
+    m = re.search(r"entr(?:y|ies)" + SEP + r"([^\n\r]+)", text, re.IGNORECASE)
     if m:
         val = m.group(1).strip()
         if re.search(r"market", val, re.IGNORECASE):
