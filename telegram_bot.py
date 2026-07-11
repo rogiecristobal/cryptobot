@@ -561,7 +561,6 @@ def build_app(manager_ref):
                         entry = float(pos.get("entryPrice", 0))
                         mark = float(pos.get("markPrice", 0))
                         upnl = float(pos.get("unrealisedPnl", 0))
-                        upnl_pct = (mark - entry) / entry * 100 * (1 if side == "LONG" else -1)
                         tag = ""
                     else:
                         side = "LONG" if (state or {}).get("position") == "LONG" else "SHORT"
@@ -573,7 +572,11 @@ def build_app(manager_ref):
 
                     if size is not None:
                         parts.append(f"  Size: {size:.4f} | Entry: {entry:.2f}")
-                        parts.append(f"  Mark: {mark:.2f} | P&L: {upnl:+.2f} ({upnl_pct:+.2f}%)")
+                        if entry:
+                            upnl_pct = (mark - entry) / entry * 100 * (1 if side == "LONG" else -1)
+                            parts.append(f"  Mark: {mark:.2f} | P&L: {upnl:+.2f} ({upnl_pct:+.2f}%)")
+                        else:
+                            parts.append(f"  Mark: {mark:.2f} | P&L: {upnl:+.2f} (N/A%)")
                     else:
                         parts.append(f"  Size: N/A (position data offline)")
 
