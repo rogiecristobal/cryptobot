@@ -551,18 +551,23 @@ def build_app(manager_ref):
                 for sym in syms:
                     state = trade_manager.db.get(sym)
                     pos = trade_manager.bybit.get_open_position(sym)
-                    if not pos:
-                        continue
-                    side = "LONG" if pos.get("side") == "Buy" else "SHORT"
-                    size = float(pos.get("size", 0))
-                    entry = float(pos.get("entryPrice", 0))
-                    mark = float(pos.get("markPrice", 0))
-                    upnl = float(pos.get("unrealisedPnl", 0))
-                    upnl_pct = (mark - entry) / entry * 100 * (1 if side == "LONG" else -1)
+                    if pos:
+                        side = "LONG" if pos.get("side") == "Buy" else "SHORT"
+                        size = float(pos.get("size", 0))
+                        entry = float(pos.get("entryPrice", 0))
+                        mark = float(pos.get("markPrice", 0))
+                        upnl = float(pos.get("unrealisedPnl", 0))
+                        upnl_pct = (mark - entry) / entry * 100 * (1 if side == "LONG" else -1)
+                    else:
+                        side = "LONG" if (state or {}).get("position") == "LONG" else "SHORT"
+                        size = entry = mark = upnl = upnl_pct = None
                     parts.append(f"")
                     parts.append(f"{sym} {side}")
-                    parts.append(f"  Size: {size:.4f} | Entry: {entry:.2f}")
-                    parts.append(f"  Mark: {mark:.2f} | P&L: {upnl:+.2f} ({upnl_pct:+.2f}%)")
+                    if size is not None:
+                        parts.append(f"  Size: {size:.4f} | Entry: {entry:.2f}")
+                        parts.append(f"  Mark: {mark:.2f} | P&L: {upnl:+.2f} ({upnl_pct:+.2f}%)")
+                    else:
+                        parts.append(f"  Size: N/A (position data offline)")
                     sl = state.get("sl_price") if state else None
                     bm = state.get("breakeven_moved", 0) if state else 0
                     if sl:

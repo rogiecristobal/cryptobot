@@ -38,7 +38,7 @@ class BybitClient:
             coin = resp["result"]["list"][0]["coin"][0]
             return {
                 "equity": float(coin["walletBalance"]),
-                "available": float(coin.get("availableToWithdraw", 0)),
+                "available": float(coin.get("availableToWithdraw") or 0),
             }
         except (KeyError, IndexError, TypeError):
             raise RuntimeError(f"Could not parse wallet info: {resp}")
