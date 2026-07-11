@@ -35,7 +35,11 @@ class StateDB:
         try:
             self.conn.execute("ALTER TABLE trades ADD COLUMN dca_price REAL")
         except sqlite3.OperationalError:
-            pass  # column already exists
+            pass
+        try:
+            self.conn.execute("ALTER TABLE trades ADD COLUMN filled_tp_prices TEXT DEFAULT '[]'")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
 
     def get(self, symbol: str):

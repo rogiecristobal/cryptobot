@@ -199,9 +199,17 @@ class TradeManager:
         # doesn't re-place an order at a price that's already been hit.
         idx = tp_ids.index(filled_order_id)
         tp_prices = self.db.loads(state["tp_prices"])
+        filled_price = None
         if idx < len(tp_prices):
-            tp_prices.pop(idx)
-        self.db.upsert(symbol, tp_prices=self.db.dumps(tp_prices))
+            filled_price = tp_prices.pop(idx)
+
+        # Track achieved TPs so the user can see them in /status
+        filled_tp_prices = self.db.loads(state.get("filled_tp_prices", "[]"))
+        if filled_price is not None:
+            filled_tp_prices.append(filled_price)
+        self.db.upsert(symbol,
+                       tp_prices=self.db.dumps(tp_prices),
+                       filled_tp_prices=self.db.dumps(filled_tp_prices))
  
         first_tp = not state["breakeven_moved"]
         if first_tp:

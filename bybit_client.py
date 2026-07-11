@@ -31,6 +31,18 @@ class BybitClient:
         except (KeyError, IndexError, TypeError):
             raise RuntimeError(f"Could not parse equity from wallet response: {resp}")
 
+    def get_wallet_info(self) -> dict:
+        """Returns equity and available balance as a dict."""
+        resp = self.http.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        try:
+            coin = resp["result"]["list"][0]["coin"][0]
+            return {
+                "equity": float(coin["walletBalance"]),
+                "available": float(coin.get("availableToWithdraw", 0)),
+            }
+        except (KeyError, IndexError, TypeError):
+            raise RuntimeError(f"Could not parse wallet info: {resp}")
+
     def get_instrument_info(self, symbol: str) -> dict:
         symbol = self._norm(symbol)
         if symbol in self._instrument_cache: 

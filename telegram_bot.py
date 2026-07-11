@@ -103,9 +103,17 @@ def build_app(manager_ref):
         if not _authorized(update):
             return
         screenshot_note = " or send a screenshot" if ocr.is_enabled() else ""
+        keyboard = [
+            [InlineKeyboardButton("❓ Help", callback_data="help:_")],
+            [
+                InlineKeyboardButton("📊 Status", callback_data="status:_"),
+                InlineKeyboardButton("💰 Balance", callback_data="balance:_"),
+            ],
+        ]
         await update.message.reply_text(
             f"Bot online. Paste a signal{screenshot_note} to stage it, "
-            f"then tap Confirm/Cancel within {config.CONFIRM_TIMEOUT_SECONDS}s."
+            f"then tap Confirm/Cancel within {config.CONFIRM_TIMEOUT_SECONDS}s.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
     # ---------- /place ----------
@@ -509,6 +517,82 @@ def build_app(manager_ref):
                 chat_id=chat_id, message_id=message_id,
                 text=result,
             )
+        elif action == "help":
+            lines = [
+                "Available commands:",
+                "",
+                "/help — Show this message",
+                "",
+                "/place <asset> <dir> <entry|market> <dca|none> <sl> <tp1> <tp2> ... [leverax]",
+                "  Stage a new trade from inline args.",
+                "",
+                "/sl <asset> <price>",
+                "  Modify stop loss on a staged or active trade.",
+                "",
+                "/tp <asset> <price1> <price2> ...",
+                "  Replace all take-profit levels.",
+                "",
+                "/dca <asset> <price|none>",
+                "  Add, update, or remove a DCA limit order.",
+                "",
+                "/entry <asset> <price|market>",
+                "  Modify entry (only before fill).",
+                "",
+                "High-cap assets (BTC, ETH, SOL, BNB, XRP, ADA) use 1.5% risk per position",
+                "  (3% max with DCA). Other assets use config.RISK_PERCENT.",
+            ]
+            await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+        elif action == "status":
+            syms = trade_manager.db.all_active()
+            if not syms:
+                await context.bot.send_message(chat_id=chat_id, text="No active positions.")
+            else:
+                parts = ["📊 Active Positions:"]
+                for sym in syms:
+                    state = trade_manager.db.get(sym)
+                    pos = trade_manager.bybit.get_open_position(sym)
+                    if not pos:
+                        continue
+                    side = "LONG" if pos.get("side") == "Buy" else "SHORT"
+                    size = float(pos.get("size", 0))
+                    entry = float(pos.get("entryPrice", 0))
+                    mark = float(pos.get("markPrice", 0))
+                    upnl = float(pos.get("unrealisedPnl", 0))
+                    upnl_pct = (mark - entry) / entry * 100 * (1 if side == "LONG" else -1)
+                    parts.append(f"")
+                    parts.append(f"{sym} {side}")
+                    parts.append(f"  Size: {size:.4f} | Entry: {entry:.2f}")
+                    parts.append(f"  Mark: {mark:.2f} | P&L: {upnl:+.2f} ({upnl_pct:+.2f}%)")
+                    sl = state.get("sl_price") if state else None
+                    bm = state.get("breakeven_moved", 0) if state else 0
+                    if sl:
+                        if bm:
+                            orig = state.get("original_sl_price", sl)
+                            parts.append(f"  SL: ✅ Breakeven (moved from {orig:.2f})")
+                        else:
+                            parts.append(f"  SL: {sl:.2f} ⬜")
+                    filled = trade_manager.db.loads(state.get("filled_tp_prices")) if state and state.get("filled_tp_prices") else []
+                    pending = trade_manager.db.loads(state["tp_prices"]) if state and state.get("tp_prices") else []
+                    tp_parts = []
+                    for p in filled:
+                        tp_parts.append(f"{p:.2f} ✅")
+                    for p in pending:
+                        tp_parts.append(f"{p:.2f} ⬜")
+                    if tp_parts:
+                        parts.append(f"  TPs: {' | '.join(tp_parts)}")
+                await context.bot.send_message(chat_id=chat_id, text="\n".join(parts))
+        elif action == "balance":
+            try:
+                info = trade_manager.bybit.get_wallet_info()
+                lines = [
+                    "💰 Balance:",
+                    f"  Equity: ${info['equity']:,.2f}",
+                    f"  Available: ${info['available']:,.2f}",
+                ]
+                await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+            except Exception as e:
+                log.exception("Error fetching balance")
+                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Could not fetch balance: {e}")
 
     # ---------- Register handlers ----------
 
