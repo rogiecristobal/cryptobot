@@ -543,14 +543,18 @@ def build_app(manager_ref):
             ]
             await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
         elif action == "status":
-            syms = trade_manager.db.all_active()
-            if not syms:
+            db_syms = set(trade_manager.db.all_active())
+            exchange_positions = {p.get("symbol"): p for p in trade_manager.bybit.get_all_open_positions()}
+            all_syms = db_syms | set(exchange_positions.keys())
+
+            if not all_syms:
                 await context.bot.send_message(chat_id=chat_id, text="No active positions.")
             else:
                 parts = ["📊 Active Positions:"]
-                for sym in syms:
+                for sym in sorted(all_syms):
                     state = trade_manager.db.get(sym)
-                    pos = trade_manager.bybit.get_open_position(sym)
+                    pos = exchange_positions.get(sym)
+
                     if pos:
                         side = "LONG" if pos.get("side") == "Buy" else "SHORT"
                         size = float(pos.get("size", 0))
@@ -558,16 +562,21 @@ def build_app(manager_ref):
                         mark = float(pos.get("markPrice", 0))
                         upnl = float(pos.get("unrealisedPnl", 0))
                         upnl_pct = (mark - entry) / entry * 100 * (1 if side == "LONG" else -1)
+                        tag = ""
                     else:
                         side = "LONG" if (state or {}).get("position") == "LONG" else "SHORT"
                         size = entry = mark = upnl = upnl_pct = None
+                        tag = " ⚠️ not tracked"
+
                     parts.append(f"")
-                    parts.append(f"{sym} {side}")
+                    parts.append(f"{sym} {side}{tag}")
+
                     if size is not None:
                         parts.append(f"  Size: {size:.4f} | Entry: {entry:.2f}")
                         parts.append(f"  Mark: {mark:.2f} | P&L: {upnl:+.2f} ({upnl_pct:+.2f}%)")
                     else:
                         parts.append(f"  Size: N/A (position data offline)")
+
                     sl = state.get("sl_price") if state else None
                     bm = state.get("breakeven_moved", 0) if state else 0
                     if sl:
@@ -576,6 +585,10 @@ def build_app(manager_ref):
                             parts.append(f"  SL: ✅ Breakeven (moved from {orig:.2f})")
                         else:
                             parts.append(f"  SL: {sl:.2f} ⬜")
+                    elif pos:
+                        # Position on exchange but no DB entry — no SL info
+                        parts.append(f"  SL: Not set in bot")
+
                     filled = trade_manager.db.loads(state.get("filled_tp_prices")) if state and state.get("filled_tp_prices") else []
                     pending = trade_manager.db.loads(state["tp_prices"]) if state and state.get("tp_prices") else []
                     tp_parts = []

@@ -116,6 +116,14 @@ class BybitClient:
                 return
             raise
 
+    def get_all_open_positions(self) -> list:
+        """Return all open USDT perpetual positions (no symbol filter)."""
+        resp = self.http.get_positions(category=self.category, settleCoin="USDT")
+        return [
+            pos for pos in resp["result"]["list"]
+            if float(pos.get("size", 0)) > 0
+        ]
+
     def get_open_position(self, symbol: str) -> dict | None:
         symbol = self._norm(symbol)
         resp = self.http.get_positions(category=self.category, symbol=symbol)
