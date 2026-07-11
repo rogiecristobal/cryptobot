@@ -7,12 +7,15 @@ Core trade lifecycle:
 """
 import logging
 import time
+from typing import Optional, List
 from signal_parser import ParsedSignal
 from bybit_client import BybitClient
 from state_db import StateDB
 import config
- 
+
 log = logging.getLogger("trade_manager")
+
+SPECIAL_ASSETS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT"}
  
  
 class TradeManager:
@@ -21,6 +24,7 @@ class TradeManager:
         self.db = db
         self.notify = notify  # async-callable(str) -> sends a Telegram message
         self.pending = {}     # symbol -> dict(signal, expiry, chat_id, message_id)
+        self.pending_mods = {}  # symbol -> dict(type, params, chat_id, message_id)
  
     # ---------- stage 1: validate + queue for confirmation ----------
  
@@ -51,25 +55,39 @@ class TradeManager:
  
     def _calc_qty(self, signal: ParsedSignal):
         equity = self.bybit.get_equity_usdt()
-        risk_amount = equity * (config.RISK_PERCENT / 100)
- 
+
+        is_special = signal.asset in SPECIAL_ASSETS
+        if is_special:
+            risk_pct = 1.5
+        else:
+            risk_pct = config.RISK_PERCENT
+
+        risk_amount = equity * (risk_pct / 100)
+
         entry_price = signal.entry
         if signal.entry_is_market:
             ticker = self.bybit.http.get_tickers(category=config.BYBIT_CATEGORY, symbol=signal.asset)
             entry_price = float(ticker["result"]["list"][0]["lastPrice"])
- 
+
         if signal.dca:
-            w_e = config.DCA_SPLIT_RATIO
-            w_d = 1 - w_e
-            avg_entry = entry_price * w_e + signal.dca * w_d
-            total_qty = risk_amount / abs(avg_entry - signal.sl)
-            qty_entry = self.bybit.round_qty(signal.asset, total_qty * w_e)
-            qty_dca = self.bybit.round_qty(signal.asset, total_qty * w_d)
+            if is_special:
+                # Each position sized independently — 1.5% risk each
+                qty_entry = risk_amount / abs(entry_price - signal.sl)
+                qty_dca = risk_amount / abs(signal.dca - signal.sl)
+                qty_entry = self.bybit.round_qty(signal.asset, qty_entry)
+                qty_dca = self.bybit.round_qty(signal.asset, qty_dca)
+            else:
+                w_e = config.DCA_SPLIT_RATIO
+                w_d = 1 - w_e
+                avg_entry = entry_price * w_e + signal.dca * w_d
+                total_qty = risk_amount / abs(avg_entry - signal.sl)
+                qty_entry = self.bybit.round_qty(signal.asset, total_qty * w_e)
+                qty_dca = self.bybit.round_qty(signal.asset, total_qty * w_d)
         else:
             total_qty = risk_amount / abs(entry_price - signal.sl)
             qty_entry = self.bybit.round_qty(signal.asset, total_qty)
             qty_dca = 0.0
- 
+
         return qty_entry, qty_dca
  
     # ---------- stage 2: confirmed -> place entry/DCA ----------
@@ -96,11 +114,12 @@ class TradeManager:
         entry_order_id = entry_order["result"]["orderId"]
  
         dca_order_id = None
+        dca_price = None
         if signal.dca and qty_dca > 0:
             dca_price = self.bybit.round_price(symbol, signal.dca)
             dca_order = self.bybit.place_limit_order(symbol, side, qty_dca, dca_price)
             dca_order_id = dca_order["result"]["orderId"]
- 
+
         self.db.upsert(
             symbol,
             position=signal.position,
@@ -115,6 +134,7 @@ class TradeManager:
             tp_prices=self.db.dumps(signal.tps),
             breakeven_moved=0,
             raw_signal=signal.asset,
+            dca_price=dca_price,
         )
 
         if signal.entry_is_market:
@@ -219,3 +239,114 @@ class TradeManager:
  
     def handle_entry_or_dca_fill(self, symbol: str):
         self.sync_protective_orders(symbol)
+
+    # ---------- modification commands (sl, tp, dca, entry) ----------
+
+    def _dca_qty_from_state(self, state: dict) -> float:
+        """Recalculate DCA qty for an active position using same risk as entry."""
+        equity = self.bybit.get_equity_usdt()
+        is_special = state["symbol"] in SPECIAL_ASSETS
+        risk_pct = 1.5 if is_special else config.RISK_PERCENT
+        risk_amount = equity * (risk_pct / 100)
+        dca_price = state.get("dca_price") or 0
+        if dca_price <= 0:
+            return 0.0
+        entry_price = state["entry_price"]
+        if entry_price == 0:
+            entry_price = state["sl_price"]
+        qty = risk_amount / max(abs(entry_price - state["sl_price"]), 1)
+        return self.bybit.round_qty(state["symbol"], qty)
+
+    def stage_modify_sl(self, symbol: str, new_sl: float) -> str:
+        """Stage an SL modification. Returns a preview prompt."""
+        state = self.db.get(symbol)
+        if not state or state["status"] != "active":
+            # Check if it's a staged trade
+            if symbol in self.pending:
+                signal = self.pending[symbol]["signal"]
+                return f"Modify SL for {symbol}?\n  Current: {signal.sl}\n  New: {new_sl}"
+            raise ValueError(f"No active position or pending trade for {symbol}.")
+
+        old_sl = state["sl_price"]
+        return f"Modify SL for {symbol}?\n  Current: {old_sl}\n  New: {new_sl}"
+
+    def stage_modify_tp(self, symbol: str, new_prices: List[float]) -> str:
+        """Stage a TP modification. Returns a preview prompt."""
+        state = self.db.get(symbol)
+        if not state or state["status"] != "active":
+            if symbol in self.pending:
+                signal = self.pending[symbol]["signal"]
+                old = ", ".join(str(t) for t in signal.tps)
+                new = ", ".join(str(t) for t in new_prices)
+                return f"Modify TPs for {symbol}?\n  Current: {old}\n  New: {new}"
+            raise ValueError(f"No active position or pending trade for {symbol}.")
+
+        old = ", ".join(str(t) for t in self.db.loads(state["tp_prices"]))
+        new = ", ".join(str(t) for t in new_prices)
+        return f"Modify TPs for {symbol}?\n  Current: {old}\n  New: {new}"
+
+    def stage_modify_dca(self, symbol: str, dca_price: Optional[float]) -> str:
+        """Stage a DCA modification. None = remove DCA."""
+        state = self.db.get(symbol)
+        if not state or state["status"] != "active":
+            if symbol in self.pending:
+                signal = self.pending[symbol]["signal"]
+                if dca_price is None:
+                    return f"Remove DCA for {symbol}?"
+                return f"Add DCA for {symbol}?\n  Price: {dca_price}"
+            raise ValueError(f"No active position or pending trade for {symbol}.")
+
+        if dca_price is None:
+            return f"Remove DCA for {symbol}?"
+        return f"Modify DCA for {symbol}?\n  Price: {dca_price}"
+
+    def stage_modify_entry(self, symbol: str, new_price: Optional[float], is_market: bool) -> str:
+        """Stage an entry modification (staged trades only)."""
+        if symbol in self.pending:
+            entry_desc = "MARKET" if is_market else new_price
+            return f"Modify Entry for {symbol}?\n  New: {entry_desc}"
+        raise ValueError(f"No pending trade for {symbol} — entry can only be modified before confirmation.")
+
+    def apply_modification(self, symbol: str) -> str:
+        """Apply a previously staged modification (active positions only). Returns a result message."""
+        mod = self.pending_mods.pop(symbol, None)
+        if not mod:
+            return f"No pending modification for {symbol}."
+
+        mod_type = mod["type"]
+        params = mod["params"]
+        state = self.db.get(symbol)
+        if not state:
+            return f"No active position for {symbol}."
+
+        if mod_type == "sl":
+            self.db.upsert(symbol, sl_price=params["new_price"])
+            self.sync_protective_orders(symbol)
+            return f"✅ SL updated for {symbol} to {params['new_price']}."
+
+        elif mod_type == "tp":
+            self.db.upsert(symbol, tp_prices=self.db.dumps(params["new_prices"]))
+            self.sync_protective_orders(symbol)
+            return f"✅ TPs updated for {symbol}: {', '.join(str(t) for t in params['new_prices'])}."
+
+        elif mod_type == "dca":
+            # Cancel existing DCA if any
+            if state.get("dca_order_id"):
+                self.bybit.cancel_order(symbol, state["dca_order_id"])
+            self.db.upsert(symbol, dca_order_id=None, dca_price=None)
+            if params["new_price"] is not None:
+                pos_side = state["position"]
+                side = "Buy" if pos_side == "LONG" else "Sell"
+                dca_qty = self._dca_qty_from_state({**state, "dca_price": params["new_price"]})
+                if dca_qty > 0:
+                    dca_price = self.bybit.round_price(symbol, params["new_price"])
+                    dca_order = self.bybit.place_limit_order(symbol, side, dca_qty, dca_price)
+                    self.db.upsert(symbol, dca_order_id=dca_order["result"]["orderId"], dca_price=dca_price)
+                    return f"✅ DCA placed for {symbol} at {dca_price} (qty ~{dca_qty})."
+            return f"✅ DCA removed for {symbol}."
+
+        return f"Unknown modification type: {mod_type}"
+
+    def cancel_modification(self, symbol: str) -> str:
+        self.pending_mods.pop(symbol, None)
+        return f"Modification for {symbol} cancelled."

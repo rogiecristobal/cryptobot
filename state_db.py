@@ -32,6 +32,10 @@ class StateDB:
     def __init__(self, path=config.DB_PATH):
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.execute(SCHEMA)
+        try:
+            self.conn.execute("ALTER TABLE trades ADD COLUMN dca_price REAL")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         self.conn.commit()
 
     def get(self, symbol: str):
