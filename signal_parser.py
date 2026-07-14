@@ -78,6 +78,11 @@ def _first_num(s: str) -> Optional[str]:
  
 def _all_nums(s: str) -> List[str]:
     return re.findall(r"\d+(?:\.\d+)?", s)
+
+
+def _last_num(s: str) -> Optional[str]:
+    nums = re.findall(r"\d+(?:\.\d+)?", s)
+    return nums[-1] if nums else None
  
  
 def extract_tps(text: str) -> List[float]:
@@ -101,7 +106,7 @@ def extract_tps(text: str) -> List[float]:
         parts = re.split(r",|(?:\s-\s)|–", line)
         for part in parts:
             part = part.strip()
-            n = _first_num(part)
+            n = _last_num(part)
             if n:
                 tps.append(float(n))
     return tps
