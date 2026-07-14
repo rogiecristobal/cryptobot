@@ -105,8 +105,10 @@ class TradeManager:
         qty_entry, qty_dca, *_ = self._calc_qty(signal)
         side = "Buy" if signal.position == "LONG" else "Sell"
 
+        max_lev = self.bybit.get_max_leverage(symbol)
+        leverage = min(signal.leverage, max_lev)
         self.bybit.set_margin_mode(symbol, signal.leverage_mode or config.DEFAULT_MARGIN_MODE)
-        self.bybit.set_leverage(symbol, signal.leverage)
+        self.bybit.set_leverage(symbol, leverage)
 
         if signal.entry_is_market:
             entry_order = self.bybit.place_market_order(symbol, side, qty_entry)

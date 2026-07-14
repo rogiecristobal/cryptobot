@@ -52,6 +52,10 @@ class BybitClient:
         self._instrument_cache[symbol] = info
         return info
 
+    def get_max_leverage(self, symbol: str) -> int:
+        info = self.get_instrument_info(symbol)
+        return int(float(info["leverageFilter"]["maxLeverage"]))
+
     def round_qty(self, symbol: str, qty: float) -> float:
         symbol = self._norm(symbol)
         info = self.get_instrument_info(symbol)
@@ -74,7 +78,9 @@ class BybitClient:
         rounded = round(price / tick) * tick
         result = round(rounded, decimals)
         if result == 0 and price > 0:
-            log.warning("round_price(%s, %s) returned 0 (tick=%s) — price too small for tick size", symbol, price, tick)
+            log.warning("round_price(%s, %s, tick=%s) tick quantization gave 0; falling back to round(price, %s)=%s",
+                        symbol, price, tick, decimals, round(price, decimals))
+            result = round(price, decimals)
         return result
 
     def _fmt_price(self, symbol: str, price: float) -> str:
@@ -99,16 +105,17 @@ class BybitClient:
             if "leverage not modified" not in str(e).lower():
                 raise
 
-    def set_margin_mode(self, symbol: str, mode: str):
+    def set_margin_mode(self, symbol: str, mode: str, leverage: int = 0):
         symbol = self._norm(symbol)
         trade_mode = 1 if mode.upper() == "ISOLATED" else 0
+        lev = min(leverage, self.get_max_leverage(symbol)) if leverage else config.DEFAULT_LEVERAGE
         try:
             self.http.switch_margin_mode(
                 category=self.category,
                 symbol=symbol,
                 tradeMode=trade_mode,
-                buyLeverage=str(config.DEFAULT_LEVERAGE),
-                sellLeverage=str(config.DEFAULT_LEVERAGE),
+                buyLeverage=str(lev),
+                sellLeverage=str(lev),
             )
         except Exception as e:
             msg = str(e).lower()
