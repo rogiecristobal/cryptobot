@@ -73,8 +73,12 @@ def build_app(manager_ref):
             "",
             "/help — Show this message",
             "",
+            "/place <asset> <dir> <entry|market> <sl> [leverax]",
+            "  Simple: entry + SL only, no TPs/DCA.",
+            "  Example: /place BTC LONG 69000 67000 5x",
+            "",
             "/place <asset> <dir> <entry|market> <dca|none> <sl> <tp1> <tp2> ... [leverax]",
-            "  Stage a new trade from inline args.",
+            "  Full: with DCA and take-profit targets.",
             "  Example: /place BTC LONG 69000 none 67000 71000 72000 5x",
             "",
             "/sl <asset> <price>",
@@ -165,14 +169,14 @@ def build_app(manager_ref):
             await update.message.reply_text(f"Invalid entry: {args[2]}")
             return
 
-        sl = _parse_float(args[3])
-        if sl is None:
-            await update.message.reply_text(f"Invalid SL: {args[3]}")
-            return
-
         # Detect format: 4 args = simple (entry + SL only), >= 6 = full
         if len(args) == 4:
             # Simple format — no TPs, no DCA
+            sl = _parse_float(args[3])
+            if sl is None:
+                await update.message.reply_text(f"Invalid SL: {args[3]}")
+                return
+
             if not entry_is_market:
                 if direction == "LONG" and sl >= entry:
                     await update.message.reply_text("For LONG, SL must be below entry.")
@@ -567,8 +571,11 @@ def build_app(manager_ref):
                 "",
                 "/help — Show this message",
                 "",
+                "/place <asset> <dir> <entry|market> <sl> [leverax]",
+                "  Simple: entry + SL only, no TPs/DCA.",
+                "",
                 "/place <asset> <dir> <entry|market> <dca|none> <sl> <tp1> <tp2> ... [leverax]",
-                "  Stage a new trade from inline args.",
+                "  Full: with DCA and take-profit targets.",
                 "",
                 "/sl <asset> <price>",
                 "  Modify stop loss on a staged or active trade.",
