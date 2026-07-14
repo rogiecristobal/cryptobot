@@ -40,7 +40,7 @@ class TradeManager:
         expiry = time.time() + config.CONFIRM_TIMEOUT_SECONDS
         self.pending[symbol] = {"signal": signal, "expiry": expiry, "chat_id": None, "message_id": None}
  
-        qty_entry, qty_dca = self._calc_qty(signal)
+        qty_entry, qty_dca, risk_amount, equity, risk_pct = self._calc_qty(signal)
         lines = [
             f"⚠️ Confirm trade — tap below within {config.CONFIRM_TIMEOUT_SECONDS}s",
             f"{symbol} ({signal.position})",
@@ -49,7 +49,9 @@ class TradeManager:
         if signal.dca:
             lines.append(f"DCA: {signal.dca}  (qty ~{qty_dca})")
         lines.append(f"SL: {signal.sl}")
-        lines.append(f"TPs: {', '.join(str(t) for t in signal.tps)}")
+        lines.append(f"Risk: ${risk_amount:.2f} ({risk_pct}% of ${equity:,.2f})")
+        if signal.tps:
+            lines.append(f"TPs: {', '.join(str(t) for t in signal.tps)}")
         lines.append(f"Leverage: {signal.leverage}x ({signal.leverage_mode or config.DEFAULT_MARGIN_MODE})")
         return "\n".join(lines)
  
@@ -88,7 +90,7 @@ class TradeManager:
             qty_entry = self.bybit.round_qty(signal.asset, total_qty)
             qty_dca = 0.0
 
-        return qty_entry, qty_dca
+        return qty_entry, qty_dca, risk_amount, equity, risk_pct
  
     # ---------- stage 2: confirmed -> place entry/DCA ----------
  
@@ -100,16 +102,21 @@ class TradeManager:
         if time.time() > entry["expiry"]:
             return f"Confirmation window for {symbol} expired — resend the signal."
  
-        qty_entry, qty_dca = self._calc_qty(signal)
+        qty_entry, qty_dca, *_ = self._calc_qty(signal)
         side = "Buy" if signal.position == "LONG" else "Sell"
- 
+
         self.bybit.set_margin_mode(symbol, signal.leverage_mode or config.DEFAULT_MARGIN_MODE)
         self.bybit.set_leverage(symbol, signal.leverage)
- 
+
         if signal.entry_is_market:
             entry_order = self.bybit.place_market_order(symbol, side, qty_entry)
         else:
             entry_price = self.bybit.round_price(symbol, signal.entry)
+            if entry_price <= 0:
+                raise ValueError(
+                    f"Entry price {signal.entry} rounded to {entry_price} for {symbol}. "
+                    f"Cannot place limit order. Try using 'market' entry instead."
+                )
             entry_order = self.bybit.place_limit_order(symbol, side, qty_entry, entry_price)
         entry_order_id = entry_order["result"]["orderId"]
  

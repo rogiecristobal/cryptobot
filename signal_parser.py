@@ -4,10 +4,57 @@ This mirrors the exact detection logic from the web formatter app,
 so a signal that renders correctly there will parse identically here.
 """
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Optional, List
- 
- 
+
+
+# Mapping from Unicode mathematical alphanumeric codepoints to ASCII.
+# Covers Bold, Italic, Bold Italic (both capital and small).
+_MATH_NORM = {}
+for base, target_start in [
+    (0x1D400, ord("A")),   # Mathematical Bold Capital A-Z
+    (0x1D41A, ord("a")),   # Mathematical Bold Small a-z
+    (0x1D434, ord("A")),   # Mathematical Italic Capital A-Z
+    (0x1D44E, ord("a")),   # Mathematical Italic Small a-z
+    (0x1D468, ord("A")),   # Mathematical Bold Italic Capital A-Z
+    (0x1D482, ord("a")),   # Mathematical Bold Italic Small a-z
+]:
+    for i in range(26):
+        _MATH_NORM[base + i] = chr(target_start + i)
+
+# Common emoji characters that appear before TP/SL labels in signals
+_EMOJI_STRIP = {
+    0x1F3AF,  # 🎯 direct hit
+    0x1F4A5,  # 💥 collision
+    0x1F4A8,  # 💨 dart
+    0x1F680,  # 🚀 rocket
+    0x1F525,  # 🔥 fire
+    0x1F4B0,  # 💰 money bag
+    0x1F4B5,  # 💵 dollar
+    0x1F6A8,  # 🚨 rotating light
+    0x26A0,   # ⚠ warning
+    0x2B50,   # ⭐ star
+}
+
+
+def _normalize_text(text: str) -> str:
+    """Flatten mathematical bold/italic to ASCII and strip common signal emojis."""
+    result = []
+    for ch in text:
+        cp = ord(ch)
+        if cp in _MATH_NORM:
+            result.append(_MATH_NORM[cp])
+        elif cp in _EMOJI_STRIP:
+            continue
+        elif unicodedata.category(ch) in ("So", "Cn") and cp > 0xFF:
+            # Strip other "Symbol, Other" and unassigned characters above ASCII range
+            continue
+        else:
+            result.append(ch)
+    return "".join(result)
+
+
 @dataclass
 class ParsedSignal:
     asset: Optional[str] = None
@@ -61,8 +108,9 @@ def extract_tps(text: str) -> List[float]:
  
  
 def parse_signal(text: str) -> ParsedSignal:
+    text = _normalize_text(text)
     data = ParsedSignal()
- 
+
     # OCR frequently swaps ':' for '.', drops it, or adds stray punctuation
     # (e.g. "Entry. 69000" instead of "Entry: 69000") — SEP tolerates that.
     SEP = r"[:.\s]+"

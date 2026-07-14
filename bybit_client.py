@@ -72,7 +72,10 @@ class BybitClient:
         tick = float(info["priceFilter"]["tickSize"])
         decimals = max(0, str(tick)[::-1].find("."))
         rounded = round(price / tick) * tick
-        return round(rounded, decimals)
+        result = round(rounded, decimals)
+        if result == 0 and price > 0:
+            log.warning("round_price(%s, %s) returned 0 (tick=%s) — price too small for tick size", symbol, price, tick)
+        return result
 
     def _fmt_price(self, symbol: str, price: float) -> str:
         info = self.get_instrument_info(symbol)

@@ -124,10 +124,14 @@ def build_app(manager_ref):
         trade_manager = manager_ref.tm
         args = context.args
 
-        if len(args) < 6:
+        if len(args) < 4:
             await update.message.reply_text(
-                "Usage: /place <asset> <direction> <entry|market> <dca|none> <sl> <tp1> <tp2> ... [leverax]\n"
-                "Example: /place BTC LONG 69000 none 67000 71000 72000 5x"
+                "Usage:\n"
+                "  /place <asset> <dir> <entry|market> <sl> [leverax]        — simple (entry + SL only)\n"
+                "  /place <asset> <dir> <entry|market> <dca|none> <sl> <tp1> <tp2> ... [leverax]  — full\n"
+                "Examples:\n"
+                "  /place BTC LONG 69000 67000 5x\n"
+                "  /place BTC LONG 69000 none 67000 71000 72000 5x"
             )
             return
 
@@ -141,8 +145,8 @@ def build_app(manager_ref):
                 await update.message.reply_text(f"Invalid leverage: {args[-1]}")
                 return
 
-        if len(args) < 6:
-            await update.message.reply_text("Need at least: asset, direction, entry, dca, sl, and one TP.")
+        if len(args) < 4:
+            await update.message.reply_text("Need at least: asset, direction, entry, and sl.")
             return
 
         asset = args[0].upper()
@@ -161,6 +165,44 @@ def build_app(manager_ref):
             await update.message.reply_text(f"Invalid entry: {args[2]}")
             return
 
+        sl = _parse_float(args[3])
+        if sl is None:
+            await update.message.reply_text(f"Invalid SL: {args[3]}")
+            return
+
+        # Detect format: 4 args = simple (entry + SL only), >= 6 = full
+        if len(args) == 4:
+            # Simple format — no TPs, no DCA
+            if not entry_is_market:
+                if direction == "LONG" and sl >= entry:
+                    await update.message.reply_text("For LONG, SL must be below entry.")
+                    return
+                if direction == "SHORT" and sl <= entry:
+                    await update.message.reply_text("For SHORT, SL must be above entry.")
+                    return
+            signal = ParsedSignal(
+                asset=asset,
+                position=direction,
+                entry=entry,
+                entry_is_market=entry_is_market,
+                dca=None,
+                leverage=leverage,
+                sl=sl,
+                tps=[],
+                errors=[],
+            )
+            await _stage_signal(update, trade_manager, signal)
+            return
+
+        if len(args) == 5:
+            await update.message.reply_text(
+                "Ambiguous arguments. Did you mean:\n"
+                "  Simple: /place <asset> <dir> <entry> <sl> [leverax]\n"
+                "  Full:   /place <asset> <dir> <entry> <dca|none> <sl> <tp1> <tp2> ... [leverax]"
+            )
+            return
+
+        # Full format (>= 6 args)
         dca_str = args[3].lower()
         dca = None if dca_str in ("none", "n", "0") else _parse_float(dca_str)
         if dca_str not in ("none", "n", "0") and dca is None:
@@ -268,7 +310,7 @@ def build_app(manager_ref):
                 signal.entry_is_market = False
 
         trade_manager.pending[symbol]["signal"] = signal
-        qty_entry, qty_dca = trade_manager._calc_qty(signal)
+        qty_entry, qty_dca, risk_amount, equity, risk_pct = trade_manager._calc_qty(signal)
         lines = [
             f"⚠️ Confirm trade — tap below within {config.CONFIRM_TIMEOUT_SECONDS}s",
             f"{symbol} ({signal.position})",
@@ -277,7 +319,9 @@ def build_app(manager_ref):
         if signal.dca:
             lines.append(f"DCA: {signal.dca}  (qty ~{qty_dca})")
         lines.append(f"SL: {signal.sl}")
-        lines.append(f"TPs: {', '.join(str(t) for t in signal.tps)}")
+        lines.append(f"Risk: ${risk_amount:.2f} ({risk_pct}% of ${equity:,.2f})")
+        if signal.tps:
+            lines.append(f"TPs: {', '.join(str(t) for t in signal.tps)}")
         lines.append(f"Leverage: {signal.leverage}x ({signal.leverage_mode or config.DEFAULT_MARGIN_MODE})")
         prompt = "\n".join(lines)
 
