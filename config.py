@@ -25,5 +25,6 @@ DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "10"))
 DEFAULT_MARGIN_MODE = os.getenv("DEFAULT_MARGIN_MODE", "ISOLATED").upper()
 
 CONFIRM_TIMEOUT_SECONDS = int(os.getenv("CONFIRM_TIMEOUT_SECONDS", "120"))
+BREAKEVEN_TIMEOUT_SECONDS = int(os.getenv("BREAKEVEN_TIMEOUT_SECONDS", "60"))
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "trades.db")

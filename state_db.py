@@ -40,6 +40,14 @@ class StateDB:
             self.conn.execute("ALTER TABLE trades ADD COLUMN filled_tp_prices TEXT DEFAULT '[]'")
         except sqlite3.OperationalError:
             pass
+        try:
+            self.conn.execute("ALTER TABLE trades ADD COLUMN manual_tp_count INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self.conn.execute("ALTER TABLE trades ADD COLUMN breakeven_prompt_msg_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
 
     def get(self, symbol: str):

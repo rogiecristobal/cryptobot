@@ -222,6 +222,18 @@ def build_app(manager_ref):
                 chat_id=chat_id, message_id=message_id,
                 text=result,
             )
+        elif action == "breakeven_yes":
+            trade_manager.apply_breakeven(symbol)
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id,
+                text=f"✅ SL moved to entry for {symbol}.",
+            )
+        elif action == "breakeven_no":
+            trade_manager.clear_breakeven_prompt(symbol)
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id,
+                text=f"❌ Keeping original SL for {symbol}.",
+            )
 
     # ---------- Register handlers ----------
 

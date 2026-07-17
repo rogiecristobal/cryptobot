@@ -245,6 +245,44 @@ class TradeManager:
         else:
             self.notify(f"🎯 Another TP hit on {symbol} — SL resynced to remaining size.")
  
+    # ---------- manual TP detection (user places TPs on Bybit UI) ----------
+
+    def handle_manual_tp_fill(self, symbol: str) -> int:
+        """Called when a reduce-only fill is detected that doesn't match our tracked orders.
+        Returns the new manual_tp_count (0 if no active state)."""
+        state = self.db.get(symbol)
+        if not state or state["status"] != "active":
+            return 0
+
+        count = (state.get("manual_tp_count") or 0) + 1
+        self.db.upsert(symbol, manual_tp_count=count)
+
+        if count == 1:
+            self.notify(f"🎯 TP1 hit on {symbol}!")
+        elif count == 2:
+            self.notify(f"🎯 TP2 hit on {symbol}!")
+        elif count >= 3:
+            self.notify(f"🎯 TP3 hit on {symbol}!")
+
+        return count
+
+    def apply_breakeven(self, symbol: str):
+        """Move SL to entry / original SL price and resync the SL order on Bybit."""
+        state = self.db.get(symbol)
+        if not state or state["status"] != "active":
+            return
+        if state.get("breakeven_moved"):
+            return
+
+        new_sl = state["entry_price"] or state["original_sl_price"]
+        self.db.upsert(symbol, sl_price=new_sl, breakeven_moved=1, breakeven_prompt_msg_id=None)
+        self.sync_protective_orders(symbol)
+        self.notify(f"✅ SL moved to entry ({new_sl}) for {symbol}.")
+
+    def clear_breakeven_prompt(self, symbol: str):
+        """User declined — clear the pending prompt flag so the timeout is a no-op."""
+        self.db.upsert(symbol, breakeven_prompt_msg_id=None)
+
     def handle_sl_fill(self, symbol: str):
         state = self.db.get(symbol)
         if not state:
