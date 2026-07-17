@@ -85,21 +85,19 @@ def main():
     def _patched_stage(signal):
         symbol = signal.asset
         result = _original_stage(signal)
-        pending = trade_manager.pending.get(symbol)
-        if pending and pending.get("chat_id"):
-            async def _expire():
-                await asyncio.sleep(config.CONFIRM_TIMEOUT_SECONDS)
-                entry = trade_manager.pending.get(symbol)
-                if entry and entry.get("message_id") and time.time() > entry.get("expiry", 0):
-                    try:
-                        await tg_app.bot.edit_message_text(
-                            chat_id=entry["chat_id"],
-                            message_id=entry["message_id"],
-                            text=f"⏱️ Confirmation for {symbol} expired.",
-                        )
-                    except Exception:
-                        pass
-            asyncio.get_event_loop().create_task(_expire())
+        async def _expire():
+            await asyncio.sleep(config.CONFIRM_TIMEOUT_SECONDS)
+            entry = trade_manager.pending.get(symbol)
+            if entry and entry.get("message_id") and time.time() > entry.get("expiry", 0):
+                try:
+                    await tg_app.bot.edit_message_text(
+                        chat_id=entry["chat_id"],
+                        message_id=entry["message_id"],
+                        text=f"⏱️ Confirmation for {symbol} expired.",
+                    )
+                except Exception:
+                    pass
+        asyncio.get_event_loop().create_task(_expire())
         return result
     trade_manager.stage_signal = _patched_stage
 
