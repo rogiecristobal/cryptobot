@@ -22,6 +22,11 @@ class BybitClient:
     def _norm(self, symbol: str) -> str:
         return symbol.replace("/", "").replace(" ", "")
 
+    @staticmethod
+    def _decimal_places(value: float) -> int:
+        s = f"{value:.10f}".rstrip("0").rstrip(".")
+        return len(s.split(".")[1]) if "." in s else 0
+
     # ---------- account / instrument info ----------
 
     def get_equity_usdt(self) -> float:
@@ -67,26 +72,29 @@ class BybitClient:
     def _fmt_qty(self, symbol: str, qty: float) -> str:
         info = self.get_instrument_info(symbol)
         step = float(info["lotSizeFilter"]["qtyStep"])
-        decimals = max(0, str(step)[::-1].find("."))
+        decimals = self._decimal_places(step)
         return f"{qty:.{decimals}f}"
 
     def round_price(self, symbol: str, price: float) -> float:
         symbol = self._norm(symbol)
         info = self.get_instrument_info(symbol)
         tick = float(info["priceFilter"]["tickSize"])
-        decimals = max(0, str(tick)[::-1].find("."))
+        decimals = self._decimal_places(tick)
         rounded = round(price / tick) * tick
         result = round(rounded, decimals)
         if result == 0 and price > 0:
-            log.warning("round_price(%s, %s, tick=%s) tick quantization gave 0; falling back to round(price, %s)=%s",
-                        symbol, price, tick, decimals, round(price, decimals))
-            result = round(price, decimals)
+            price_decimals = self._decimal_places(price)
+            result = round(price, max(decimals, price_decimals))
+            log.warning("round_price(%s, %s, tick=%s, decimals=%s) -> %s",
+                        symbol, price, tick, max(decimals, price_decimals), result)
+            if result == 0:
+                result = price
         return result
 
     def _fmt_price(self, symbol: str, price: float) -> str:
         info = self.get_instrument_info(symbol)
         tick = float(info["priceFilter"]["tickSize"])
-        decimals = max(0, str(tick)[::-1].find("."))
+        decimals = self._decimal_places(tick)
         return f"{price:.{decimals}f}"
 
     # ---------- position / leverage setup ----------

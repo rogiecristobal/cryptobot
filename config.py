@@ -19,7 +19,7 @@ BYBIT_CATEGORY = os.getenv("BYBIT_CATEGORY", "linear")
 TELEGRAM_BOT_TOKEN = _required("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = int(_required("TELEGRAM_CHAT_ID"))
 
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.0"))
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "3.0"))
 DCA_SPLIT_RATIO = float(os.getenv("DCA_SPLIT_RATIO", "0.5"))  # fraction of total qty on the initial entry order when DCA is present
 DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "10"))
 DEFAULT_MARGIN_MODE = os.getenv("DEFAULT_MARGIN_MODE", "ISOLATED").upper()

@@ -60,9 +60,9 @@ class TradeManager:
 
         is_special = signal.asset in SPECIAL_ASSETS
         if is_special:
-            risk_pct = 1.5
+            risk_pct = 5.0
         else:
-            risk_pct = config.RISK_PERCENT
+            risk_pct = 3.0
 
         risk_amount = equity * (risk_pct / 100)
 
@@ -92,8 +92,8 @@ class TradeManager:
 
         return qty_entry, qty_dca, risk_amount, equity, risk_pct
  
-    # ---------- stage 2: confirmed -> place entry/DCA ----------
- 
+    # ---------- stage 2: confirmed -> place entry/DCA + SL/TP ----------
+  
     def confirm(self, symbol: str) -> str:
         entry = self.pending.pop(symbol, None)
         if not entry:
@@ -101,9 +101,10 @@ class TradeManager:
         signal = entry["signal"]
         if time.time() > entry["expiry"]:
             return f"Confirmation window for {symbol} expired — resend the signal."
- 
+
         qty_entry, qty_dca, *_ = self._calc_qty(signal)
         side = "Buy" if signal.position == "LONG" else "Sell"
+        close_side = "Sell" if side == "Buy" else "Buy"
 
         max_lev = self.bybit.get_max_leverage(symbol)
         leverage = min(signal.leverage, max_lev)
@@ -114,14 +115,9 @@ class TradeManager:
             entry_order = self.bybit.place_market_order(symbol, side, qty_entry)
         else:
             entry_price = self.bybit.round_price(symbol, signal.entry)
-            if entry_price <= 0:
-                raise ValueError(
-                    f"Entry price {signal.entry} rounded to {entry_price} for {symbol}. "
-                    f"Cannot place limit order. Try using 'market' entry instead."
-                )
             entry_order = self.bybit.place_limit_order(symbol, side, qty_entry, entry_price)
         entry_order_id = entry_order["result"]["orderId"]
- 
+
         dca_order_id = None
         dca_price = None
         if signal.dca and qty_dca > 0:
@@ -129,14 +125,28 @@ class TradeManager:
             dca_order = self.bybit.place_limit_order(symbol, side, qty_dca, dca_price)
             dca_order_id = dca_order["result"]["orderId"]
 
+        sl_order_id = None
+        tp_order_ids = []
+        qty_for_protection = qty_entry + (qty_dca if signal.dca and qty_dca > 0 else 0)
+
+        if qty_for_protection > 0:
+            sl_price = self.bybit.round_price(symbol, signal.sl)
+            sl_order = self.bybit.place_stop_loss(symbol, close_side, qty_for_protection, sl_price)
+            sl_order_id = sl_order["result"]["orderId"]
+
+            if signal.tps:
+                tp_price = self.bybit.round_price(symbol, signal.tps[0])
+                tp_order = self.bybit.place_limit_order(symbol, close_side, qty_for_protection, tp_price, reduce_only=True)
+                tp_order_ids.append(tp_order["result"]["orderId"])
+
         self.db.upsert(
             symbol,
             position=signal.position,
             status="active",
             entry_order_id=entry_order_id,
             dca_order_id=dca_order_id,
-            sl_order_id=None,
-            tp_order_ids=self.db.dumps([]),
+            sl_order_id=sl_order_id,
+            tp_order_ids=self.db.dumps(tp_order_ids),
             entry_price=signal.entry if not signal.entry_is_market else 0,
             sl_price=signal.sl,
             original_sl_price=signal.sl,
@@ -146,10 +156,10 @@ class TradeManager:
             dca_price=dca_price,
         )
 
-        if signal.entry_is_market:
-            self.sync_protective_orders(symbol)
-            return f"Market entry filled for {symbol}. SL/TPs armed."
-        return f"Limit entry placed for {symbol}. Waiting for fill to arm SL/TPs."
+        entry_desc = "Market" if signal.entry_is_market else "Limit"
+        sl_desc = f"SL armed" if sl_order_id else "SL not placed"
+        tp_desc = f", TP armed" if tp_order_ids else ""
+        return f"{entry_desc} entry placed for {symbol}. {sl_desc}{tp_desc}."
 
     def cancel(self, symbol: str) -> str:
         self.pending.pop(symbol, None)
@@ -263,7 +273,7 @@ class TradeManager:
         """Recalculate DCA qty for an active position using same risk as entry."""
         equity = self.bybit.get_equity_usdt()
         is_special = state["symbol"] in SPECIAL_ASSETS
-        risk_pct = 1.5 if is_special else config.RISK_PERCENT
+        risk_pct = 5.0 if is_special else 3.0
         risk_amount = equity * (risk_pct / 100)
         dca_price = state.get("dca_price") or 0
         if dca_price <= 0:
