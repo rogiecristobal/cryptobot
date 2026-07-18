@@ -36,6 +36,26 @@ class TradeManager:
         symbol = signal.asset
         if self.bybit.has_open_orders_or_position(symbol):
             raise ValueError(f"{symbol} already has an open position or pending order — new signal rejected.")
+
+        # Validate SL/TP against current MarkPrice
+        try:
+            ticker = self.bybit.http.get_tickers(category=config.BYBIT_CATEGORY, symbol=symbol)
+            mark = float(ticker["result"]["list"][0]["markPrice"])
+        except Exception:
+            mark = None
+        if mark is not None:
+            if signal.position == "LONG":
+                if signal.sl >= mark:
+                    raise ValueError(f"SL {signal.sl} must be below current MarkPrice {mark} for LONG.")
+                for tp in signal.tps:
+                    if tp <= mark:
+                        raise ValueError(f"TP {tp} must be above current MarkPrice {mark} for LONG.")
+            else:
+                if signal.sl <= mark:
+                    raise ValueError(f"SL {signal.sl} must be above current MarkPrice {mark} for SHORT.")
+                for tp in signal.tps:
+                    if tp >= mark:
+                        raise ValueError(f"TP {tp} must be below current MarkPrice {mark} for SHORT.")
  
         expiry = time.time() + config.CONFIRM_TIMEOUT_SECONDS
         self.pending[symbol] = {"signal": signal, "expiry": expiry, "chat_id": None, "message_id": None}
