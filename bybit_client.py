@@ -181,7 +181,7 @@ class BybitClient:
         return self.http.place_order(
             category=self.category, symbol=symbol, side=side,
             orderType="Market", qty=self._fmt_qty(symbol, qty),
-            triggerPrice=self._fmt_price(symbol, trigger_price), triggerDirection=1 if side == "Sell" else 2,
+            triggerPrice=self._fmt_price(symbol, trigger_price), triggerDirection=2 if side == "Sell" else 1,
             triggerBy="MarkPrice",
             reduceOnly=True, closeOnTrigger=True,
         )

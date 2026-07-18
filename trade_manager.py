@@ -130,14 +130,20 @@ class TradeManager:
         qty_for_protection = qty_entry + (qty_dca if signal.dca and qty_dca > 0 else 0)
 
         if qty_for_protection > 0:
-            sl_price = self.bybit.round_price(symbol, signal.sl)
-            sl_order = self.bybit.place_stop_loss(symbol, close_side, qty_for_protection, sl_price)
-            sl_order_id = sl_order["result"]["orderId"]
+            try:
+                sl_price = self.bybit.round_price(symbol, signal.sl)
+                sl_order = self.bybit.place_stop_loss(symbol, close_side, qty_for_protection, sl_price)
+                sl_order_id = sl_order["result"]["orderId"]
+            except Exception as e:
+                log.warning(f"SL placement failed for {symbol}: {e}")
 
             if signal.tps:
-                tp_price = self.bybit.round_price(symbol, signal.tps[0])
-                tp_order = self.bybit.place_limit_order(symbol, close_side, qty_for_protection, tp_price, reduce_only=True)
-                tp_order_ids.append(tp_order["result"]["orderId"])
+                try:
+                    tp_price = self.bybit.round_price(symbol, signal.tps[0])
+                    tp_order = self.bybit.place_limit_order(symbol, close_side, qty_for_protection, tp_price, reduce_only=True)
+                    tp_order_ids.append(tp_order["result"]["orderId"])
+                except Exception as e:
+                    log.warning(f"TP placement failed for {symbol}: {e}")
 
         self.db.upsert(
             symbol,
