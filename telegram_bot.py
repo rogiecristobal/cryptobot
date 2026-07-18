@@ -201,8 +201,7 @@ def build_app(manager_ref):
                 log.exception("Error confirming trade")
                 await context.bot.edit_message_text(
                     chat_id=chat_id, message_id=message_id,
-                    text=f"⚠️ Error placing the trade for {symbol}: {e}\n"
-                         f"Check Bybit directly to confirm nothing partial went through.",
+                    text=f"⚠️ Error placing the trade for {symbol}: {e}",
                 )
         elif action == "cancel":
             result = trade_manager.cancel(symbol)

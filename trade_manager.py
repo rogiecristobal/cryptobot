@@ -112,10 +112,10 @@ class TradeManager:
         self.bybit.set_leverage(symbol, leverage)
 
         if signal.entry_is_market:
-            entry_order = self.bybit.place_market_order(symbol, side, qty_entry)
+            entry_order = self.bybit.place_market_order(symbol, side, qty_entry, stop_loss=signal.sl)
         else:
             entry_price = self.bybit.round_price(symbol, signal.entry)
-            entry_order = self.bybit.place_limit_order(symbol, side, qty_entry, entry_price)
+            entry_order = self.bybit.place_limit_order(symbol, side, qty_entry, entry_price, stop_loss=signal.sl)
         entry_order_id = entry_order["result"]["orderId"]
 
         dca_order_id = None
@@ -125,34 +125,12 @@ class TradeManager:
             dca_order = self.bybit.place_limit_order(symbol, side, qty_dca, dca_price)
             dca_order_id = dca_order["result"]["orderId"]
 
-        sl_order_id = None
-        tp_order_ids = []
-        qty_for_protection = qty_entry + (qty_dca if signal.dca and qty_dca > 0 else 0)
-
-        if qty_for_protection > 0:
-            try:
-                sl_price = self.bybit.round_price(symbol, signal.sl)
-                sl_order = self.bybit.place_stop_loss(symbol, close_side, qty_for_protection, sl_price)
-                sl_order_id = sl_order["result"]["orderId"]
-            except Exception as e:
-                log.warning(f"SL placement failed for {symbol}: {e}")
-
-            if signal.tps:
-                try:
-                    tp_price = self.bybit.round_price(symbol, signal.tps[0])
-                    tp_order = self.bybit.place_limit_order(symbol, close_side, qty_for_protection, tp_price, reduce_only=True)
-                    tp_order_ids.append(tp_order["result"]["orderId"])
-                except Exception as e:
-                    log.warning(f"TP placement failed for {symbol}: {e}")
-
         self.db.upsert(
             symbol,
             position=signal.position,
             status="active",
             entry_order_id=entry_order_id,
             dca_order_id=dca_order_id,
-            sl_order_id=sl_order_id,
-            tp_order_ids=self.db.dumps(tp_order_ids),
             entry_price=signal.entry if not signal.entry_is_market else 0,
             sl_price=signal.sl,
             original_sl_price=signal.sl,
@@ -163,9 +141,7 @@ class TradeManager:
         )
 
         entry_desc = "Market" if signal.entry_is_market else "Limit"
-        sl_desc = f"SL armed" if sl_order_id else "SL not placed"
-        tp_desc = f", TP armed" if tp_order_ids else ""
-        return f"{entry_desc} entry placed for {symbol}. {sl_desc}{tp_desc}."
+        return f"{entry_desc} entry placed for {symbol} with native SL."
 
     def cancel(self, symbol: str) -> str:
         self.pending.pop(symbol, None)
@@ -174,43 +150,17 @@ class TradeManager:
     # ---------- stage 3: fill-driven protective order management ----------
  
     def sync_protective_orders(self, symbol: str):
-        """Cancel + re-place SL and TP orders sized to the CURRENT actual position. Call this
-        after any fill event (entry, DCA) that could change position size."""
+        """Update the native SL price on the position to match current state.
+        Call this after any fill event or breakeven move."""
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
             return
         position = self.bybit.get_open_position(symbol)
         if not position:
             return  # nothing filled yet
- 
-        total_qty = float(position["size"])
-        pos_side = position["side"]  # "Buy" or "Sell"
-        close_side = "Sell" if pos_side == "Buy" else "Buy"
- 
-        if state["sl_order_id"]:
-            self.bybit.cancel_order(symbol, state["sl_order_id"])
-        for oid in self.db.loads(state["tp_order_ids"]):
-            self.bybit.cancel_order(symbol, oid)
- 
+
         sl_price = self.bybit.round_price(symbol, state["sl_price"])
-        sl_order = self.bybit.place_stop_loss(symbol, close_side, total_qty, sl_price)
-        sl_order_id = sl_order["result"]["orderId"]
- 
-        tp_prices = self.db.loads(state["tp_prices"])
-        n = len(tp_prices)
-        tp_order_ids = []
-        if n:
-            base_qty = self.bybit.round_qty(symbol, total_qty / n)
-            allocated = 0.0
-            for i, tp_price in enumerate(tp_prices):
-                qty = base_qty if i < n - 1 else self.bybit.round_qty(symbol, total_qty - allocated)
-                allocated += qty
-                order = self.bybit.place_limit_order(symbol, close_side, qty,
-                                                       self.bybit.round_price(symbol, tp_price),
-                                                       reduce_only=True)
-                tp_order_ids.append(order["result"]["orderId"])
- 
-        self.db.upsert(symbol, sl_order_id=sl_order_id, tp_order_ids=self.db.dumps(tp_order_ids))
+        self.bybit.set_position_sl(symbol, sl_price)
  
     def handle_tp_fill(self, symbol: str, filled_order_id: str):
         state = self.db.get(symbol)

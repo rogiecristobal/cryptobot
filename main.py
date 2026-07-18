@@ -116,23 +116,25 @@ def main():
             if order_id == state["entry_order_id"] or order_id == state["dca_order_id"]:
                 log.info(f"Entry/DCA fill: {symbol} {order_id}")
                 trade_manager.handle_entry_or_dca_fill(symbol)
-            elif order_id == state["sl_order_id"]:
-                log.info(f"SL fill: {symbol} {order_id}")
-                trade_manager.handle_sl_fill(symbol)
-            else:
-                tp_ids = db.loads(state["tp_order_ids"])
-                if order_id in tp_ids:
-                    log.info(f"TP fill: {symbol} {order_id}")
-                    trade_manager.handle_tp_fill(symbol, order_id)
-                elif item.get("reduceOnly") and state["status"] == "active":
+            elif item.get("reduceOnly") and state["status"] == "active":
+                order_type = item.get("orderType", "")
+                if order_type == "Market":
+                    log.info(f"SL fill detected: {symbol} {order_id}")
+                    trade_manager.handle_sl_fill(symbol)
+                else:
                     log.info(f"Manual TP fill detected: {symbol} {order_id}")
                     asyncio.get_event_loop().create_task(
                         _handle_manual_tp(symbol, trade_manager, tg_app, db)
                     )
- 
+
     def on_position_update(msg):
-        # reserved for future use (e.g. detecting manual intervention on the exchange UI)
-        pass
+        for item in msg.get("data", []):
+            symbol = item.get("symbol")
+            size = float(item.get("size", 0))
+            state = db.get(symbol)
+            if state and state["status"] == "active" and size == 0:
+                log.info(f"Position fully closed on {symbol} (position update)")
+                trade_manager.handle_sl_fill(symbol)
  
     bybit.start_private_ws(on_order=on_order_update, on_position=on_position_update)
     log.info("Bybit private WebSocket connected. Starting Telegram polling...")

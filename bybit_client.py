@@ -159,32 +159,50 @@ class BybitClient:
 
     # ---------- orders ----------
 
-    def place_market_order(self, symbol: str, side: str, qty: float, reduce_only=False):
+    def place_market_order(self, symbol: str, side: str, qty: float, reduce_only=False,
+                           stop_loss: float | None = None):
         symbol = self._norm(symbol)
-        return self.http.place_order(
+        body = dict(
             category=self.category, symbol=symbol, side=side,
             orderType="Market", qty=self._fmt_qty(symbol, qty), reduceOnly=reduce_only,
         )
+        if stop_loss is not None:
+            body["stopLoss"] = self._fmt_price(symbol, stop_loss)
+            body["slTriggerBy"] = "MarkPrice"
+            body["slOrderType"] = "Market"
+            body["tpslMode"] = "Full"
+        return self.http.place_order(**body)
 
-    def place_limit_order(self, symbol: str, side: str, qty: float, price: float, reduce_only=False):
+    def place_limit_order(self, symbol: str, side: str, qty: float, price: float, reduce_only=False,
+                          stop_loss: float | None = None):
         symbol = self._norm(symbol)
-        return self.http.place_order(
+        body = dict(
             category=self.category, symbol=symbol, side=side,
             orderType="Limit", qty=self._fmt_qty(symbol, qty), price=self._fmt_price(symbol, price),
             timeInForce="GTC", reduceOnly=reduce_only,
         )
+        if stop_loss is not None:
+            body["stopLoss"] = self._fmt_price(symbol, stop_loss)
+            body["slTriggerBy"] = "MarkPrice"
+            body["slOrderType"] = "Market"
+            body["tpslMode"] = "Full"
+        return self.http.place_order(**body)
 
-    def place_stop_loss(self, symbol: str, side: str, qty: float, trigger_price: float):
+    def set_position_sl(self, symbol: str, sl_price: float, trigger_by: str = "MarkPrice"):
         symbol = self._norm(symbol)
-        # side here is the CLOSING side (opposite of position side)
-        # triggerBy=MarkPrice avoids the SL firing on thin-orderbook last-price wicks
-        return self.http.place_order(
-            category=self.category, symbol=symbol, side=side,
-            orderType="Market", qty=self._fmt_qty(symbol, qty),
-            triggerPrice=self._fmt_price(symbol, trigger_price), triggerDirection=2 if side == "Sell" else 1,
-            triggerBy="MarkPrice",
-            reduceOnly=True, closeOnTrigger=True,
-        )
+        try:
+            self.http.set_trading_stop(
+                category=self.category, symbol=symbol,
+                stopLoss=self._fmt_price(symbol, sl_price),
+                slTriggerBy=trigger_by,
+                slOrderType="Market",
+                tpslMode="Full",
+                positionIdx=0,
+            )
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                return  # already at this price — harmless
+            raise
 
     def cancel_order(self, symbol: str, order_id: str):
         symbol = self._norm(symbol)
