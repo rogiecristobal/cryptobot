@@ -160,31 +160,49 @@ class BybitClient:
     # ---------- orders ----------
 
     def place_market_order(self, symbol: str, side: str, qty: float, reduce_only=False,
-                           stop_loss: float | None = None):
+                           stop_loss: float | None = None,
+                           take_profit: float | None = None):
         symbol = self._norm(symbol)
         body = dict(
             category=self.category, symbol=symbol, side=side,
             orderType="Market", qty=self._fmt_qty(symbol, qty), reduceOnly=reduce_only,
         )
+        has_tpsl = False
         if stop_loss is not None:
             body["stopLoss"] = self._fmt_price(symbol, stop_loss)
             body["slTriggerBy"] = "MarkPrice"
             body["slOrderType"] = "Market"
+            has_tpsl = True
+        if take_profit is not None:
+            body["takeProfit"] = self._fmt_price(symbol, take_profit)
+            body["tpTriggerBy"] = "MarkPrice"
+            body["tpOrderType"] = "Market"
+            has_tpsl = True
+        if has_tpsl:
             body["tpslMode"] = "Full"
         return self.http.place_order(**body)
 
     def place_limit_order(self, symbol: str, side: str, qty: float, price: float, reduce_only=False,
-                          stop_loss: float | None = None):
+                          stop_loss: float | None = None,
+                          take_profit: float | None = None):
         symbol = self._norm(symbol)
         body = dict(
             category=self.category, symbol=symbol, side=side,
             orderType="Limit", qty=self._fmt_qty(symbol, qty), price=self._fmt_price(symbol, price),
             timeInForce="GTC", reduceOnly=reduce_only,
         )
+        has_tpsl = False
         if stop_loss is not None:
             body["stopLoss"] = self._fmt_price(symbol, stop_loss)
             body["slTriggerBy"] = "MarkPrice"
             body["slOrderType"] = "Market"
+            has_tpsl = True
+        if take_profit is not None:
+            body["takeProfit"] = self._fmt_price(symbol, take_profit)
+            body["tpTriggerBy"] = "MarkPrice"
+            body["tpOrderType"] = "Market"
+            has_tpsl = True
+        if has_tpsl:
             body["tpslMode"] = "Full"
         return self.http.place_order(**body)
 

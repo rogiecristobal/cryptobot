@@ -119,8 +119,20 @@ def main():
             elif item.get("reduceOnly") and state["status"] == "active":
                 order_type = item.get("orderType", "")
                 if order_type == "Market":
-                    log.info(f"SL fill detected: {symbol} {order_id}")
-                    trade_manager.handle_sl_fill(symbol)
+                    # Native SL or native TP triggered — distinguish by triggerDirection
+                    # SHORT: trigger=1 (price rose) = SL, trigger=2 (price fell) = TP
+                    # LONG:  trigger=2 (price fell) = SL, trigger=1 (price rose) = TP
+                    td = item.get("triggerDirection")
+                    is_native_tp = (
+                        (state["position"] == "LONG" and td == 1)
+                        or (state["position"] == "SHORT" and td == 2)
+                    ) if td else False
+                    if is_native_tp:
+                        log.info(f"Native TP fill detected: {symbol} {order_id}")
+                        trade_manager.handle_sl_fill(symbol, source="TP")
+                    else:
+                        log.info(f"SL fill detected: {symbol} {order_id}")
+                        trade_manager.handle_sl_fill(symbol)
                 else:
                     log.info(f"Manual TP fill detected: {symbol} {order_id}")
                     asyncio.get_event_loop().create_task(
@@ -134,7 +146,7 @@ def main():
             state = db.get(symbol)
             if state and state["status"] == "active" and size == 0:
                 log.info(f"Position fully closed on {symbol} (position update)")
-                trade_manager.handle_sl_fill(symbol)
+                trade_manager.handle_sl_fill(symbol, source="Position")
  
     bybit.start_private_ws(on_order=on_order_update, on_position=on_position_update)
     log.info("Bybit private WebSocket connected. Starting Telegram polling...")

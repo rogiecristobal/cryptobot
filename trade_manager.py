@@ -111,11 +111,14 @@ class TradeManager:
         self.bybit.set_margin_mode(symbol, signal.leverage_mode or config.DEFAULT_MARGIN_MODE)
         self.bybit.set_leverage(symbol, leverage)
 
+        tp = signal.tps[0] if signal.tps else None
         if signal.entry_is_market:
-            entry_order = self.bybit.place_market_order(symbol, side, qty_entry, stop_loss=signal.sl)
+            entry_order = self.bybit.place_market_order(symbol, side, qty_entry,
+                                                        stop_loss=signal.sl, take_profit=tp)
         else:
             entry_price = self.bybit.round_price(symbol, signal.entry)
-            entry_order = self.bybit.place_limit_order(symbol, side, qty_entry, entry_price, stop_loss=signal.sl)
+            entry_order = self.bybit.place_limit_order(symbol, side, qty_entry, entry_price,
+                                                       stop_loss=signal.sl, take_profit=tp)
         entry_order_id = entry_order["result"]["orderId"]
 
         dca_order_id = None
@@ -141,6 +144,8 @@ class TradeManager:
         )
 
         entry_desc = "Market" if signal.entry_is_market else "Limit"
+        if tp is not None:
+            return f"{entry_desc} entry placed for {symbol} with native SL & TP."
         return f"{entry_desc} entry placed for {symbol} with native SL."
 
     def cancel(self, symbol: str) -> str:
@@ -239,24 +244,24 @@ class TradeManager:
         """User declined — clear the pending prompt flag so the timeout is a no-op."""
         self.db.upsert(symbol, breakeven_prompt_msg_id=None)
 
-    def handle_sl_fill(self, symbol: str):
+    def handle_sl_fill(self, symbol: str, source: str = "SL"):
+        """Called when a native SL or native TP triggers. source is 'SL', 'TP', or 'Position'."""
         state = self.db.get(symbol)
         if not state:
             return
         self.bybit.cancel_all(symbol)
- 
-        # Safety net: don't just trust closeOnTrigger closed everything —
-        # verify, and force-close any residual with a market order if not.
+
+        # Verify position is closed, force-close any residual
         position = self.bybit.get_open_position(symbol)
         if position and float(position.get("size", 0)) > 0:
             side = position["side"]
             close_side = "Sell" if side == "Buy" else "Buy"
             qty = float(position["size"])
             self.bybit.close_position_market(symbol, close_side, qty)
-            self.notify(f"🛑 SL hit on {symbol} — residual position detected, force-closed {qty}.")
- 
+            self.notify(f"🛑 {source} triggered on {symbol} — residual detected, force-closed {qty}.")
+
         self.db.delete(symbol)
-        self.notify(f"🛑 SL hit on {symbol} — all related orders cancelled, position closed.")
+        self.notify(f"🛑 {source} triggered on {symbol} — position closed.")
  
     def handle_entry_or_dca_fill(self, symbol: str):
         self.sync_protective_orders(symbol)
