@@ -108,6 +108,14 @@ async def _handle_fill_async(item: dict, states: dict, trade_manager: TradeManag
             await _handle_manual_tp(symbol, trade_manager, tg_app, db)
 
 
+async def _handle_position_close(symbol: str, trade_manager: TradeManager, db: StateDB):
+    """Check and handle position closure from the event loop thread so db.get()
+    sees the state after any simultaneous order handler has deleted it."""
+    state = db.get(symbol)
+    if state and state["status"] == "active":
+        await asyncio.to_thread(trade_manager.handle_sl_fill, symbol, "Position")
+
+
 def main():
     bybit = BybitClient()
     db = StateDB()
@@ -167,11 +175,10 @@ def main():
         for item in msg.get("data", []):
             symbol = item.get("symbol")
             size = float(item.get("size", 0))
-            state = db.get(symbol)
-            if state and state["status"] == "active" and size == 0:
+            if size == 0:
                 log.info("Position fully closed on %s (position update)", symbol)
                 _fire_and_forget(
-                    asyncio.to_thread(trade_manager.handle_sl_fill, symbol, "Position"),
+                    _handle_position_close(symbol, trade_manager, db),
                     loop,
                 )
 
