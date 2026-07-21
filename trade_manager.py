@@ -216,7 +216,7 @@ class TradeManager:
         else:
             entry_price = self.bybit.round_price(symbol, signal.entry)
             entry_order = self.bybit.place_limit_order(symbol, side, qty_entry, entry_price,
-                                                       stop_loss=signal.sl, take_profit=tp)
+                                                       stop_loss=None, take_profit=None)
         entry_order_id = entry_order["result"]["orderId"]
 
         dca_order_id = None
@@ -224,7 +224,7 @@ class TradeManager:
         if signal.dca and qty_dca > 0:
             dca_price = self.bybit.round_price(symbol, signal.dca)
             dca_order = self.bybit.place_limit_order(symbol, side, qty_dca, dca_price,
-                                                     stop_loss=signal.sl, take_profit=tp)
+                                                     stop_loss=None, take_profit=None)
             dca_order_id = dca_order["result"]["orderId"]
 
         self.db.upsert(
@@ -367,9 +367,7 @@ class TradeManager:
             state = self.db.get(symbol)
             if state and state["entry_price"] == 0 and avg_price > 0:
                 self.db.upsert(symbol, entry_price=avg_price)
-        state = self.db.get(symbol)
-        if state and state.get("sl_price") != state.get("original_sl_price"):
-            self.sync_protective_orders(symbol)
+        self.sync_protective_orders(symbol)
 
     # ---------- modification commands (sl, tp, dca, entry) ----------
 
