@@ -327,9 +327,11 @@ class TradeManager:
         self.db.upsert(symbol, breakeven_prompt_msg_id=None)
 
     def handle_sl_fill(self, symbol: str, source: str = "SL"):
-        state = self.db.get(symbol)
-        if not state:
-            return
+        with self._lock:
+            state = self.db.get(symbol)
+            if not state:
+                return
+            self.db.delete(symbol)
 
         try:
             self.bybit.cancel_all(symbol)
@@ -344,9 +346,7 @@ class TradeManager:
             log.error("Force-close failed for %s: %s", symbol, e)
             self.notify(f"⚠️ {source} on {symbol} — force-close failed: {e}")
         finally:
-            self.db.delete(symbol)
-            if not self.db.get(symbol):
-                self.notify(f"🛑 {source} triggered on {symbol} — position closed.")
+            self.notify(f"🛑 {source} triggered on {symbol} — position closed.")
 
     def handle_entry_or_dca_fill(self, symbol: str):
         position = self.bybit.get_open_position(symbol)
