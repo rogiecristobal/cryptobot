@@ -2,11 +2,36 @@
 Thin wrapper around pybit's unified trading HTTP + private WebSocket.
 All Bybit-specific calls live here so trade_manager.py stays exchange-agnostic-ish.
 """
+import functools
+import time
 import logging
+from decimal import Decimal
 from pybit.unified_trading import HTTP, WebSocket
 import config
 
 log = logging.getLogger("bybit_client")
+
+
+def _retry(max_attempts=3, delay=1):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exc = e
+                    msg = str(e).lower()
+                    if "timeout" in msg or "rate limit" in msg or "too many requests" in msg:
+                        log.warning("Retrying %s after: %s (attempt %d/%d)",
+                                    func.__name__, e, attempt + 1, max_attempts)
+                        time.sleep(delay * (attempt + 1))
+                    else:
+                        raise
+            raise last_exc
+        return wrapper
+    return decorator
 
 
 class BybitClient:
@@ -15,17 +40,19 @@ class BybitClient:
             api_key=config.BYBIT_API_KEY,
             api_secret=config.BYBIT_API_SECRET,
             testnet=False,
+            timeout=30,
         )
         self.category = config.BYBIT_CATEGORY
-        self._instrument_cache = {}
+        self._instrument_cache = {}  # symbol -> (info, timestamp)
+        self._cache_ttl = 300
+        self._ws = None
 
     def _norm(self, symbol: str) -> str:
         return symbol.replace("/", "").replace(" ", "")
 
     @staticmethod
     def _decimal_places(value: float) -> int:
-        s = f"{value:.10f}".rstrip("0").rstrip(".")
-        return len(s.split(".")[1]) if "." in s else 0
+        return abs(Decimal(str(value)).as_tuple().exponent)
 
     # ---------- account / instrument info ----------
 
@@ -34,7 +61,8 @@ class BybitClient:
         try:
             return float(resp["result"]["list"][0]["coin"][0]["walletBalance"])
         except (KeyError, IndexError, TypeError):
-            raise RuntimeError(f"Could not parse equity from wallet response: {resp}")
+            log.debug("Raw wallet response: %s", resp)
+            raise RuntimeError("Could not parse equity from Bybit wallet response")
 
     def get_wallet_info(self) -> dict:
         """Returns equity and available balance as a dict."""
@@ -46,15 +74,19 @@ class BybitClient:
                 "available": float(coin.get("availableToWithdraw") or 0),
             }
         except (KeyError, IndexError, TypeError):
-            raise RuntimeError(f"Could not parse wallet info: {resp}")
+            log.debug("Raw wallet response: %s", resp)
+            raise RuntimeError("Could not parse wallet info from Bybit response")
 
     def get_instrument_info(self, symbol: str) -> dict:
         symbol = self._norm(symbol)
-        if symbol in self._instrument_cache: 
-            return self._instrument_cache[symbol] 
+        now = time.time()
+        if symbol in self._instrument_cache:
+            info, ts = self._instrument_cache[symbol]
+            if now - ts < self._cache_ttl:
+                return info
         resp = self.http.get_instruments_info(category=self.category, symbol=symbol)
         info = resp["result"]["list"][0]
-        self._instrument_cache[symbol] = info
+        self._instrument_cache[symbol] = (info, now)
         return info
 
     def get_max_leverage(self, symbol: str) -> int:
@@ -152,13 +184,14 @@ class BybitClient:
 
     def has_open_orders_or_position(self, symbol: str) -> bool:
         symbol = self._norm(symbol)
-        if self.get_open_position(symbol):
-            return True
         resp = self.http.get_open_orders(category=self.category, symbol=symbol)
-        return len(resp["result"]["list"]) > 0
+        if resp["result"]["list"]:
+            return True
+        return self.get_open_position(symbol) is not None
 
     # ---------- orders ----------
 
+    @_retry()
     def place_market_order(self, symbol: str, side: str, qty: float, reduce_only=False,
                            stop_loss: float | None = None,
                            take_profit: float | None = None):
@@ -182,6 +215,7 @@ class BybitClient:
             body["tpslMode"] = "Full"
         return self.http.place_order(**body)
 
+    @_retry()
     def place_limit_order(self, symbol: str, side: str, qty: float, price: float, reduce_only=False,
                           stop_loss: float | None = None,
                           take_profit: float | None = None):
@@ -206,7 +240,9 @@ class BybitClient:
             body["tpslMode"] = "Full"
         return self.http.place_order(**body)
 
-    def set_position_sl(self, symbol: str, sl_price: float, trigger_by: str = "MarkPrice"):
+    @_retry()
+    def set_position_sl(self, symbol: str, sl_price: float, trigger_by: str = "MarkPrice",
+                        position_idx: int = 0):
         symbol = self._norm(symbol)
         try:
             self.http.set_trading_stop(
@@ -215,7 +251,7 @@ class BybitClient:
                 slTriggerBy=trigger_by,
                 slOrderType="Market",
                 tpslMode="Full",
-                positionIdx=0,
+                positionIdx=position_idx,
             )
         except Exception as e:
             if "not modified" in str(e).lower():
@@ -227,8 +263,9 @@ class BybitClient:
         try:
             self.http.cancel_order(category=self.category, symbol=symbol, orderId=order_id)
         except Exception as e:
-            log.warning(f"Cancel failed for {order_id} ({symbol}): {e}")
+            log.warning("Cancel failed for %s (%s): %s", order_id, symbol, e)
 
+    @_retry()
     def cancel_all(self, symbol: str):
         symbol = self._norm(symbol)
         self.http.cancel_all_orders(category=self.category, symbol=symbol)
@@ -240,8 +277,7 @@ class BybitClient:
     # ---------- websocket (fills / position updates) ----------
 
     def start_private_ws(self, on_order, on_position):
-        ws = WebSocket(testnet=False, channel_type="private",
-                        api_key=config.BYBIT_API_KEY, api_secret=config.BYBIT_API_SECRET)
-        ws.order_stream(callback=on_order)
-        ws.position_stream(callback=on_position)
-        return ws
+        self._ws = WebSocket(testnet=False, channel_type="private",
+                              api_key=config.BYBIT_API_KEY, api_secret=config.BYBIT_API_SECRET)
+        self._ws.order_stream(callback=on_order)
+        self._ws.position_stream(callback=on_position)

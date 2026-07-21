@@ -14,5 +14,6 @@ class ParsedSignal:
     leverage_mode: Optional[str] = None      # "Cross" / "Isolated" / None
     sl: Optional[float] = None
     margin_percent: Optional[float] = None
+    raw_text: str = ""
     tps: List[float] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
