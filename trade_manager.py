@@ -61,7 +61,10 @@ class TradeManager:
                     self.sync_protective_orders(symbol)
                 messages.append(f"✅ {symbol}: reconciled (size {actual_size}), SL resynced.")
             else:
-                self.bybit.cancel_all(symbol)
+                try:
+                    self.bybit.cancel_all(symbol)
+                except Exception as e:
+                    log.warning("cancel_all failed for %s during reconcile: %s", symbol, e)
                 self.db.delete(symbol)
                 messages.append(f"🛑 {symbol}: position closed while offline — cleaned up.")
 
