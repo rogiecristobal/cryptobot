@@ -189,6 +189,18 @@ class TradeManager:
         if time.time() > entry["expiry"]:
             return f"Confirmation window for {symbol} expired — resend the signal."
 
+        # Re-validate SL against current mark price
+        try:
+            ticker = self.bybit.http.get_tickers(category=config.BYBIT_CATEGORY, symbol=symbol)
+            mark = float(ticker["result"]["list"][0]["markPrice"])
+        except Exception:
+            mark = None
+        if mark is not None:
+            if signal.position == "LONG" and signal.sl >= mark:
+                return f"❌ Trade aborted: SL {signal.sl} is now above mark price {mark}."
+            if signal.position == "SHORT" and signal.sl <= mark:
+                return f"❌ Trade aborted: SL {signal.sl} is now below mark price {mark}."
+
         qty_entry, qty_dca, *_ = entry.get("cached_qty") or self._calc_qty(signal)
         side = "Buy" if signal.position == "LONG" else "Sell"
 
