@@ -105,6 +105,10 @@ class StateDB:
             rows = self.conn.execute("SELECT symbol FROM trades WHERE status='active'").fetchall()
             return [r[0] for r in rows]
 
+    def close(self):
+        with self.lock:
+            self.conn.close()
+
     @staticmethod
     def dumps(obj) -> str:
         return json.dumps(obj)

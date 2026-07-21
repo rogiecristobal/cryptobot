@@ -478,3 +478,50 @@ class TradeManager:
         with self._lock:
             self.pending_mods.pop(symbol, None)
         return f"Modification for {symbol} cancelled."
+
+    # ---------- status & close ----------
+
+    def get_status(self, symbol: Optional[str] = None) -> str:
+        wallet = self.bybit.get_wallet_info()
+        lines = [f"📊 Equity: ${wallet['equity']:,.2f} | Available: ${wallet['available']:,.2f}"]
+
+        symbols = [symbol] if symbol else self.db.all_active()
+        if not symbols:
+            lines.append("\nNo active positions.")
+            return "\n".join(lines)
+
+        for sym in symbols:
+            state = self.db.get(sym)
+            pos = self.bybit.get_open_position(sym)
+            if not state or not pos:
+                lines.append(f"\n{sym}: no active position")
+                continue
+            side = state["position"]
+            entry = state["entry_price"] or float(pos.get("avgPrice", 0))
+            mark = float(pos.get("markPrice", 0))
+            qty = float(pos.get("size", 0))
+            leverage = int(float(pos.get("leverage", 1)))
+            pnl = float(pos.get("unrealisedPnl", 0))
+            pnl_pct = (pnl / max(entry * qty / leverage, 1e-8)) * 100 if entry > 0 else 0
+            sl = state["sl_price"]
+            tp_raw = self.db.loads(state.get("tp_prices", "[]"))
+            tps = ", ".join(str(t) for t in tp_raw) if tp_raw else "none"
+            dca_info = f"\n  DCA: {state['dca_price']}" if state.get("dca_price") else ""
+            be = " ✓" if state.get("breakeven_moved") else ""
+
+            lines.append(
+                f"\n{sym} {side}{be}"
+                f"\n  Entry: {entry:,.1f} | Mark: {mark:,.1f}"
+                f"\n  PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)"
+                f"\n  SL: {sl} | TP: {tps}"
+                f"{dca_info}"
+            )
+
+        return "\n".join(lines)
+
+    def close_position(self, symbol: str) -> str:
+        state = self.db.get(symbol)
+        if not state or state["status"] != "active":
+            return f"No active position for {symbol}."
+        self.handle_sl_fill(symbol, source="Manual close")
+        return f"✅ {symbol} position closed."

@@ -281,3 +281,10 @@ class BybitClient:
                               api_key=config.BYBIT_API_KEY, api_secret=config.BYBIT_API_SECRET)
         self._ws.order_stream(callback=on_order)
         self._ws.position_stream(callback=on_position)
+
+    def stop_ws(self):
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception as e:
+                log.warning("WebSocket close error: %s", e)

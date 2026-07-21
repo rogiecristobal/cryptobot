@@ -27,6 +27,12 @@ class ManagerRef:
     tm = None
 
 
+def _fire_and_forget(coro, loop):
+    """Schedule a coroutine on the event loop and log any unhandled exceptions."""
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    future.add_done_callback(lambda f: log.error("Unhandled exception in background task: %s", f.exception()) if f.exception() else None)
+
+
 async def _handle_manual_tp(symbol: str, trade_manager: TradeManager, tg_app, db: StateDB):
     """Async handler for a detected manual TP fill — notifies and prompts for breakeven on TP1."""
     count = trade_manager.handle_manual_tp_fill(symbol)
@@ -68,7 +74,7 @@ async def _handle_manual_tp(symbol: str, trade_manager: TradeManager, tg_app, db
     asyncio.get_event_loop().create_task(_auto_breakeven())
 
 
-async def _handle_fill_async(item: dict, trade_manager: TradeManager, tg_app, db: StateDB, loop):
+async def _handle_fill_async(item: dict, states: dict, trade_manager: TradeManager, tg_app, db: StateDB, loop):
     """Async wrapper for fill handling, offloads blocking work via to_thread."""
     symbol = item.get("symbol")
     status = item.get("orderStatus")
@@ -76,7 +82,7 @@ async def _handle_fill_async(item: dict, trade_manager: TradeManager, tg_app, db
     if status != "Filled":
         return
 
-    state = db.get(symbol)
+    state = states.get(symbol) if states else db.get(symbol)
     if not state:
         return
 
@@ -112,13 +118,10 @@ def main():
     loop = asyncio.get_event_loop()
 
     def notify(text: str):
-        try:
-            asyncio.run_coroutine_threadsafe(
-                tg_app.bot.send_message(chat_id=config.TELEGRAM_CHAT_ID, text=text),
-                loop,
-            )
-        except Exception as e:
-            log.error("notify() failed: %s", e)
+        _fire_and_forget(
+            tg_app.bot.send_message(chat_id=config.TELEGRAM_CHAT_ID, text=text),
+            loop,
+        )
 
     trade_manager = TradeManager(bybit, db, notify)
     manager_ref.tm = trade_manager
@@ -144,14 +147,19 @@ def main():
                     )
                 except Exception:
                     pass
-        asyncio.get_event_loop().create_task(_expire())
+        asyncio.run_coroutine_threadsafe(_expire(), loop)
         return result
     trade_manager.stage_signal = _patched_stage
 
     def on_order_update(msg):
-        for item in msg.get("data", []):
-            asyncio.run_coroutine_threadsafe(
-                _handle_fill_async(item, trade_manager, tg_app, db, loop),
+        items = msg.get("data", [])
+        if not items:
+            return
+        symbols = [item.get("symbol") for item in items if item.get("symbol")]
+        states = db.get_many(symbols) if symbols else {}
+        for item in items:
+            _fire_and_forget(
+                _handle_fill_async(item, states, trade_manager, tg_app, db, loop),
                 loop,
             )
 
@@ -162,14 +170,22 @@ def main():
             state = db.get(symbol)
             if state and state["status"] == "active" and size == 0:
                 log.info("Position fully closed on %s (position update)", symbol)
-                asyncio.run_coroutine_threadsafe(
+                _fire_and_forget(
                     asyncio.to_thread(trade_manager.handle_sl_fill, symbol, "Position"),
                     loop,
                 )
 
     bybit.start_private_ws(on_order=on_order_update, on_position=on_position_update)
     log.info("Bybit private WebSocket connected. Starting Telegram polling...")
-    tg_app.run_polling(bootstrap_retries=-1)
+    try:
+        tg_app.run_polling(bootstrap_retries=-1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        log.info("Shutting down...")
+        bybit.stop_ws()
+        db.close()
+        logging.shutdown()
 
 
 if __name__ == "__main__":

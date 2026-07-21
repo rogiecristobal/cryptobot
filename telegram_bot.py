@@ -280,6 +280,87 @@ def build_app(manager_ref):
             return
         await _stage_modification(update, manager_ref.tm, manager_ref.tm.stage_modify_entry, symbol, new_price, is_market)
 
+    # ---------- /help ----------
+
+    async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _authorized(update):
+            return
+        await update.message.reply_text(
+            "🤖 CryptoBot Commands\n\n"
+            "/place <ASSET> LONG|SHORT <ENTRY|market> SL <SL> [options]\n"
+            "  Options: TP <price> DCA <price> RISK <%> LEVERAGEx\n"
+            "  Example: /place BTC LONG market SL 67000 TP 71000 RISK 3 5x\n\n"
+            "/sl <SYMBOL> <price>     \u2014 Modify stop loss\n"
+            "/tp <SYMBOL> <p1> [p2]   \u2014 Modify take profit prices\n"
+            "/dca <SYMBOL> [price]    \u2014 Add/remove DCA order\n"
+            "/entry <SYMBOL> <price>  \u2014 Modify entry (pending only)\n\n"
+            "/status [SYMBOL]         \u2014 Show positions & P&L\n"
+            "/close <SYMBOL|all>      \u2014 Close position(s)\n"
+            "/help                    \u2014 This message"
+        )
+
+    # ---------- /status ----------
+
+    async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _authorized(update):
+            return
+        trade_manager = manager_ref.tm
+        symbol = context.args[0].upper() if context.args else None
+        if symbol and not symbol.endswith("USDT"):
+            symbol += "USDT"
+        try:
+            result = await asyncio.to_thread(trade_manager.get_status, symbol)
+            await update.message.reply_text(result)
+        except Exception as e:
+            log.exception("Error fetching status")
+            await update.message.reply_text(f"Error: {e}")
+
+    # ---------- /close ----------
+
+    async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _authorized(update):
+            return
+        trade_manager = manager_ref.tm
+        args = context.args
+
+        if not args:
+            await update.message.reply_text("Usage: /close <SYMBOL|all>")
+            return
+
+        if args[0].lower() == "all":
+            symbols = trade_manager.db.all_active()
+            if not symbols:
+                await update.message.reply_text("No active positions to close.")
+                return
+            keyboard = [
+                [InlineKeyboardButton("⚠️ Close all", callback_data="close_all:all")],
+                [InlineKeyboardButton("Cancel", callback_data="cancel:all")],
+            ]
+            await update.message.reply_text(
+                f"Close ALL {len(symbols)} active positions?",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+
+        symbol = args[0].upper()
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+        state = trade_manager.db.get(symbol)
+        if not state or state["status"] != "active":
+            await update.message.reply_text(f"No active position for {symbol}.")
+            return
+
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Close", callback_data=f"close:{symbol}"),
+                InlineKeyboardButton("Cancel", callback_data=f"cancel:{symbol}"),
+            ]
+        ]
+        await update.message.reply_text(
+            f"Close {symbol} {state['position']}?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
     # ---------- Inline button callbacks ----------
 
     async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -335,6 +416,20 @@ def build_app(manager_ref):
                 chat_id=chat_id, message_id=message_id,
                 text=f"❌ Keeping original SL for {symbol}.",
             )
+        elif action == "close":
+            result = await asyncio.to_thread(trade_manager.close_position, symbol)
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=result,
+            )
+        elif action == "close_all":
+            messages = []
+            for sym in trade_manager.db.all_active():
+                msg = await asyncio.to_thread(trade_manager.close_position, sym)
+                messages.append(msg)
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id,
+                text="\n".join(messages),
+            )
 
     # ---------- Register handlers ----------
 
@@ -343,5 +438,8 @@ def build_app(manager_ref):
     app.add_handler(CommandHandler("tp", tp_command))
     app.add_handler(CommandHandler("dca", dca_command))
     app.add_handler(CommandHandler("entry", entry_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("close", close_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     return app
