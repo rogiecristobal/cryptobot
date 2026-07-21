@@ -355,7 +355,9 @@ class TradeManager:
             state = self.db.get(symbol)
             if state and state["entry_price"] == 0 and avg_price > 0:
                 self.db.upsert(symbol, entry_price=avg_price)
-        self.sync_protective_orders(symbol)
+        state = self.db.get(symbol)
+        if state and state.get("sl_price") != state.get("original_sl_price"):
+            self.sync_protective_orders(symbol)
 
     # ---------- modification commands (sl, tp, dca, entry) ----------
 
