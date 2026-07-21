@@ -243,9 +243,10 @@ class TradeManager:
         )
 
         entry_desc = "Market" if signal.entry_is_market else "Limit"
+        sl_desc = " with native SL" if signal.entry_is_market else " (SL applied after fill)"
         if tp is not None:
-            return f"{entry_desc} entry placed for {symbol} with native SL & TP."
-        return f"{entry_desc} entry placed for {symbol} with native SL."
+            return f"{entry_desc} entry placed for {symbol}{sl_desc} & TP."
+        return f"{entry_desc} entry placed for {symbol}{sl_desc}."
 
     def cancel(self, symbol: str) -> str:
         with self._lock:
@@ -367,6 +368,20 @@ class TradeManager:
             state = self.db.get(symbol)
             if state and state["entry_price"] == 0 and avg_price > 0:
                 self.db.upsert(symbol, entry_price=avg_price)
+                # Only check SL breach on the initial entry fill (not DCA fills)
+                sl_price = state.get("sl_price", 0)
+                pos_side = state.get("position", "")
+                try:
+                    ticker = self.bybit.http.get_tickers(category=config.BYBIT_CATEGORY, symbol=symbol)
+                    mark = float(ticker["result"]["list"][0]["markPrice"])
+                except Exception:
+                    mark = None
+                if mark is not None and sl_price > 0:
+                    sl_breached = (pos_side == "LONG" and mark <= sl_price) or (pos_side == "SHORT" and mark >= sl_price)
+                    if sl_breached:
+                        log.warning("%s entry filled but mark %.2f already past SL %.2f — closing immediately", symbol, mark, sl_price)
+                        self.handle_sl_fill(symbol, "SL")
+                        return
         self.sync_protective_orders(symbol)
 
     # ---------- modification commands (sl, tp, dca, entry) ----------
