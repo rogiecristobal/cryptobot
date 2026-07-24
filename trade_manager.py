@@ -58,7 +58,10 @@ class TradeManager:
                 self.db.upsert(symbol, breakeven_prompt_msg_id=None)
                 state = self.db.get(symbol)
                 if state and state.get("sl_price"):
-                    self.sync_protective_orders(symbol)
+                    try:
+                        self.sync_protective_orders(symbol)
+                    except Exception as e:
+                        log.warning("sync_protective_orders failed during reconcile for %s: %s", symbol, e)
                 messages.append(f"✅ {symbol}: reconciled (size {actual_size}), SL resynced.")
             else:
                 try:
@@ -263,14 +266,11 @@ class TradeManager:
         if not position:
             return
 
-        idx = 0
-        if state["position"] == "LONG":
-            idx = 1
-        elif state["position"] == "SHORT":
-            idx = 2
-
         sl_price = self.bybit.round_price(symbol, state["sl_price"])
-        self.bybit.set_position_sl(symbol, sl_price, position_idx=idx)
+        try:
+            self.bybit.set_position_sl(symbol, sl_price, position_idx=0)
+        except Exception as e:
+            log.warning("set_position_sl failed for %s: %s", symbol, e)
 
     def handle_tp_fill(self, symbol: str, filled_order_id: str):
         state = self.db.get(symbol)

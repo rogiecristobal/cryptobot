@@ -254,9 +254,10 @@ class BybitClient:
                 positionIdx=position_idx,
             )
         except Exception as e:
-            if "not modified" in str(e).lower():
-                return  # already at this price — harmless
-            raise
+            msg = str(e).lower()
+            if "not modified" in msg:
+                return
+            log.warning("set_trading_stop failed for %s (idx=%s, sl=%s): %s", symbol, position_idx, sl_price, e)
 
     def cancel_order(self, symbol: str, order_id: str):
         symbol = self._norm(symbol)
