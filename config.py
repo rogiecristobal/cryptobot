@@ -2,6 +2,7 @@
 Central config. Loads everything from .env — never hardcode secrets here.
 """
 import os
+import certifi
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -44,3 +45,12 @@ if BREAKEVEN_TIMEOUT_SECONDS <= 0:
     raise RuntimeError(f"BREAKEVEN_TIMEOUT_SECONDS must be positive, got {BREAKEVEN_TIMEOUT_SECONDS}")
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "trades.db")
+
+# SSL: ensure Python's SSL context can find CA certificates.
+# Termux restarts can reset SSL_CERT_FILE, causing HTTPS failures.
+_ssl_ca_path = os.environ.get("SSL_CERT_FILE") or certifi.where()
+if not os.path.isfile(_ssl_ca_path):
+    import warnings
+    warnings.warn(f"CA bundle not found at {_ssl_ca_path}, falling back to certifi")
+    _ssl_ca_path = certifi.where()
+os.environ.setdefault("SSL_CERT_FILE", _ssl_ca_path)

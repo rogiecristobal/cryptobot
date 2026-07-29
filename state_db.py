@@ -38,7 +38,16 @@ class StateDB:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute(SCHEMA)
+        self._integrity_check()
         self._migrate()
+
+    def _integrity_check(self):
+        try:
+            row = self.conn.execute("PRAGMA integrity_check").fetchone()
+            if row and row[0] != "ok":
+                log.warning("DB integrity check failed: %s", row[0])
+        except Exception as e:
+            log.warning("Could not check DB integrity: %s", e)
 
     def _migrate(self):
         migrations = [

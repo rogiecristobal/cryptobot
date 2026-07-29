@@ -4,8 +4,13 @@ Entrypoint. Runs the Telegram bot (polling) and the Bybit private WebSocket
 """
 import asyncio
 import logging
+import os
+import ssl
 import sys
 import time
+
+import requests
+import urllib3.exceptions
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -21,6 +26,11 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler("logs/bot.log")],
 )
 log = logging.getLogger("main")
+
+_ssl_path = os.environ.get("SSL_CERT_FILE", "not set")
+log.info("SSL CA bundle: %s (exists=%s)", _ssl_path,
+         os.path.isfile(_ssl_path) if os.environ.get("SSL_CERT_FILE") else "N/A")
+log.info("OpenSSL default verify paths: cafile=%s", ssl.get_default_verify_paths().cafile)
 
 
 class ManagerRef:
@@ -136,8 +146,16 @@ def main():
     manager_ref.tm = trade_manager
 
     # Reconcile active positions on startup
-    for msg in trade_manager.reconcile():
-        notify(msg)
+    try:
+        for msg in trade_manager.reconcile():
+            notify(msg)
+    except (requests.exceptions.SSLError, urllib3.exceptions.SSLError) as e:
+        log.critical("SSL connection failed on startup: %s", e)
+        log.critical("Try: pkg install ca-certificates && update-ca-certificates")
+        notify(f"SSL Error on startup: {e}\nCheck CA certificates on this device.")
+        return
+    except Exception as e:
+        log.error("Reconciliation failed: %s", e)
 
     # Patch stage_signal to auto-expire confirmation buttons after timeout
     _original_stage = trade_manager.stage_signal
