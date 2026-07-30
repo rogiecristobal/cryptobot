@@ -55,6 +55,8 @@ class StateDB:
             ("ALTER TABLE trades ADD COLUMN filled_tp_prices TEXT DEFAULT '[]'", "filled_tp_prices"),
             ("ALTER TABLE trades ADD COLUMN manual_tp_count INTEGER DEFAULT 0", "manual_tp_count"),
             ("ALTER TABLE trades ADD COLUMN breakeven_prompt_msg_id INTEGER", "breakeven_prompt_msg_id"),
+            ("ALTER TABLE trades ADD COLUMN trailing_distance REAL", "trailing_distance"),
+            ("ALTER TABLE trades ADD COLUMN trailing_r_mult REAL", "trailing_r_mult"),
         ]
         for sql, col in migrations:
             try:

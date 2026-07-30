@@ -259,6 +259,37 @@ class BybitClient:
                 return
             log.warning("set_trading_stop failed for %s (idx=%s, sl=%s): %s", symbol, position_idx, sl_price, e)
 
+    def set_trailing_stop(self, symbol: str, distance: float, activation: float | None = None):
+        symbol = self._norm(symbol)
+        kwargs = dict(
+            category=self.category, symbol=symbol,
+            trailingStop=str(distance),
+            tpslMode="Full",
+            positionIdx=0,
+        )
+        if activation is not None:
+            kwargs["activePrice"] = self._fmt_price(symbol, activation)
+        try:
+            self.http.set_trading_stop(**kwargs)
+        except Exception as e:
+            msg = str(e).lower()
+            if "not modified" in msg:
+                return
+            log.warning("set_trailing_stop failed for %s: %s", symbol, e)
+            raise
+
+    def cancel_trailing_stop(self, symbol: str):
+        symbol = self._norm(symbol)
+        try:
+            self.http.set_trading_stop(
+                category=self.category, symbol=symbol,
+                trailingStop="0",
+                tpslMode="Full",
+                positionIdx=0,
+            )
+        except Exception as e:
+            log.warning("cancel_trailing_stop failed for %s: %s", symbol, e)
+
     def cancel_order(self, symbol: str, order_id: str):
         symbol = self._norm(symbol)
         try:

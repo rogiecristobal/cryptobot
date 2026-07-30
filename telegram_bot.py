@@ -24,7 +24,7 @@ def _parse_float(s: str) -> Optional[float]:
         return None
 
 
-_LABELS = {"sl", "tp", "dca", "risk"}
+_LABELS = {"sl", "tp", "dca", "risk", "trail"}
 
 
 async def _stage_signal(update: Update, trade_manager, signal: ParsedSignal):
@@ -97,12 +97,13 @@ def build_app(manager_ref):
         if len(args) < 4:
             await update.message.reply_text(
                 "Usage:\n"
-                "  /place <ASSET> LONG|SHORT <ENTRY|market> SL <SL> [TP <TP>] [DCA <DCA>] [RISK <%>] [LEVERAGEx]\n"
+                "  /place <ASSET> LONG|SHORT <ENTRY|market> SL <SL> [TP <TP>] [DCA <DCA>] [RISK <%>] [LEVERAGEx] [TRAIL [mult]]\n"
                 "Examples:\n"
                 "  /place BTC LONG 69000 SL 67000 TP 71000 5x\n"
                 "  /place BTC LONG 69000 SL 67000 5x\n"
                 "  /place ETH LONG 3500 SL 3400 TP 3600 DCA 3450 RISK 5 3x\n"
-                "  /place SOL LONG market SL 140"
+                "  /place SOL LONG market SL 140\n"
+                "  /place BTC LONG market SL 67000 TP 71000 TRAIL 2"
             )
             return
 
@@ -127,12 +128,26 @@ def build_app(manager_ref):
         dca = None
         risk_pct = None
         leverage = config.DEFAULT_LEVERAGE
+        trailing_mult = None
 
         rest = args[3:]
         i = 0
         while i < len(rest):
             token = rest[i]
             label = token.lower()
+            if label == "trail":
+                if i + 1 < len(rest):
+                    try:
+                        val = float(rest[i + 1])
+                        if val > 0:
+                            trailing_mult = val
+                            i += 1
+                    except (ValueError, TypeError):
+                        pass
+                if trailing_mult is None:
+                    trailing_mult = 1.0
+                i += 1
+                continue
             if label in _LABELS:
                 if i + 1 >= len(rest):
                     await update.message.reply_text(f"Missing value for {token}.")
@@ -199,6 +214,7 @@ def build_app(manager_ref):
             dca=dca,
             leverage=leverage,
             margin_percent=risk_pct,
+            trailing_r_mult=trailing_mult,
             raw_text=update.message.text,
             sl=sl,
             tps=tps,
@@ -280,6 +296,49 @@ def build_app(manager_ref):
             return
         await _stage_modification(update, manager_ref.tm, manager_ref.tm.stage_modify_entry, symbol, new_price, is_market)
 
+    # ---------- /trail ----------
+
+    async def trail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _authorized(update):
+            return
+        trade_manager = manager_ref.tm
+        args = context.args
+        if len(args) < 1:
+            await update.message.reply_text(
+                "Usage:\n"
+                "  /trail <SYMBOL> [mult]   \u2014 Set trailing at R \u00d7 mult (default 1R)\n"
+                "  /trail <SYMBOL> off      \u2014 Cancel trailing, restore original SL\n\n"
+                "Examples:\n"
+                "  /trail BTCUSDT        \u2014 1R trailing\n"
+                "  /trail BTCUSDT 2      \u2014 2R trailing\n"
+                "  /trail BTCUSDT 0.5    \u2014 0.5R trailing\n"
+                "  /trail BTCUSDT off    \u2014 Cancel"
+            )
+            return
+        symbol = args[0].upper()
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+        if len(args) >= 2 and args[1].lower() in ("off", "cancel", "none", "0"):
+            try:
+                result = await asyncio.to_thread(trade_manager.cancel_trailing, symbol)
+                await update.message.reply_text(result)
+            except Exception as e:
+                await update.message.reply_text(f"Error: {e}")
+            return
+        mult = 1.0
+        if len(args) >= 2:
+            try:
+                mult = float(args[1])
+                if mult <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text(
+                    f"Invalid multiplier: {args[1]}. Use a positive number or 'off'."
+                )
+                return
+        await _stage_modification(update, trade_manager,
+                                  trade_manager.stage_modify_trail, symbol, mult)
+
     # ---------- /help ----------
 
     async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -293,7 +352,9 @@ def build_app(manager_ref):
             "/sl <SYMBOL> <price>     \u2014 Modify stop loss\n"
             "/tp <SYMBOL> <p1> [p2]   \u2014 Modify take profit prices\n"
             "/dca <SYMBOL> [price]    \u2014 Add/remove DCA order\n"
-            "/entry <SYMBOL> <price>  \u2014 Modify entry (pending only)\n\n"
+            "/entry <SYMBOL> <price>  \u2014 Modify entry (pending only)\n"
+            "/trail <SYMBOL> [mult]   \u2014 Set trailing stop (default 1R)\n"
+            "/trail <SYMBOL> off      \u2014 Cancel trailing, restore SL\n\n"
             "/status [SYMBOL]         \u2014 Show positions & P&L\n"
             "/close <SYMBOL|all>      \u2014 Close position(s)\n"
             "/help                    \u2014 This message"
@@ -438,6 +499,7 @@ def build_app(manager_ref):
     app.add_handler(CommandHandler("tp", tp_command))
     app.add_handler(CommandHandler("dca", dca_command))
     app.add_handler(CommandHandler("entry", entry_command))
+    app.add_handler(CommandHandler("trail", trail_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("close", close_command))

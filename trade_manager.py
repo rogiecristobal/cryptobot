@@ -62,6 +62,11 @@ class TradeManager:
                         self.sync_protective_orders(symbol)
                     except Exception as e:
                         log.warning("sync_protective_orders failed during reconcile for %s: %s", symbol, e)
+                if state and state.get("trailing_distance") and state.get("breakeven_moved"):
+                    try:
+                        self._activate_trailing_if_needed(symbol)
+                    except Exception as e:
+                        log.warning("Could not re-activate trailing for %s: %s", symbol, e)
                 messages.append(f"✅ {symbol}: reconciled (size {actual_size}), SL resynced.")
             else:
                 try:
@@ -142,6 +147,10 @@ class TradeManager:
                 "cached_qty": (qty_entry, qty_dca, risk_amount, equity, risk_pct),
             }
 
+        trailing_desc = ""
+        if signal.trailing_r_mult is not None:
+            trailing_desc = f"\nTrailing: {signal.trailing_r_mult}R after breakeven"
+
         lines = [
             f"⚠️ Confirm trade — tap below within {config.CONFIRM_TIMEOUT_SECONDS}s",
             f"{symbol} ({signal.position})",
@@ -153,7 +162,7 @@ class TradeManager:
         lines.append(f"Risk: ${risk_amount:.2f} ({risk_pct}% of ${equity:,.2f})")
         if signal.tps:
             lines.append(f"TPs: {', '.join(str(t) for t in signal.tps)}")
-        lines.append(f"Leverage: {signal.leverage}x ({signal.leverage_mode or config.DEFAULT_MARGIN_MODE})")
+        lines.append(f"Leverage: {signal.leverage}x ({signal.leverage_mode or config.DEFAULT_MARGIN_MODE}){trailing_desc}")
         return "\n".join(lines)
 
     def _calc_qty(self, signal: ParsedSignal):
@@ -245,6 +254,19 @@ class TradeManager:
             dca_price=dca_price,
         )
 
+        # Save trailing stop parameters (distance calculated after fill for market entries)
+        if signal.trailing_r_mult is not None:
+            if not signal.entry_is_market and signal.entry and signal.sl:
+                risk = abs(signal.entry - signal.sl)
+                td = round(risk * signal.trailing_r_mult, 2)
+                if td > 0:
+                    self.db.upsert(symbol, trailing_distance=td,
+                                   trailing_r_mult=signal.trailing_r_mult)
+                else:
+                    self.db.upsert(symbol, trailing_r_mult=signal.trailing_r_mult)
+            else:
+                self.db.upsert(symbol, trailing_r_mult=signal.trailing_r_mult)
+
         entry_desc = "Market" if signal.entry_is_market else "Limit"
         sl_desc = " with native SL" if signal.entry_is_market else " (SL applied after fill)"
         if tp is not None:
@@ -261,6 +283,9 @@ class TradeManager:
     def sync_protective_orders(self, symbol: str):
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
+            return
+        # If trailing stop is active, skip fixed SL to avoid conflict
+        if state.get("trailing_distance") and state.get("breakeven_moved"):
             return
         position = self.bybit.get_open_position(symbol)
         if not position:
@@ -301,6 +326,9 @@ class TradeManager:
         self.sync_protective_orders(symbol)
 
         if first_tp:
+            self._activate_trailing_if_needed(symbol)
+
+        if first_tp:
             self.notify(f"🎯 TP hit on {symbol} — SL moved to breakeven ({new_sl}).")
         else:
             self.notify(f"🎯 Another TP hit on {symbol} — SL resynced to remaining size.")
@@ -333,11 +361,38 @@ class TradeManager:
 
         new_sl = state["entry_price"] or state["original_sl_price"]
         self.db.upsert(symbol, sl_price=new_sl, breakeven_moved=1, breakeven_prompt_msg_id=None)
-        self.sync_protective_orders(symbol)
+
+        if not self._activate_trailing_if_needed(symbol):
+            self.sync_protective_orders(symbol)
+
         self.notify(f"✅ SL moved to entry ({new_sl}) for {symbol}.")
 
     def clear_breakeven_prompt(self, symbol: str):
         self.db.upsert(symbol, breakeven_prompt_msg_id=None)
+
+    def _activate_trailing_if_needed(self, symbol: str) -> bool:
+        state = self.db.get(symbol)
+        if not state or state["status"] != "active":
+            return False
+        dist = state.get("trailing_distance")
+        if not dist or float(dist) <= 0:
+            return False
+        entry = state.get("entry_price", 0)
+        if entry <= 0:
+            return False
+        pos = state.get("position", "LONG")
+        distance = float(dist)
+        activation = entry + distance if pos == "LONG" else entry - distance
+        try:
+            self.bybit.set_trailing_stop(symbol, distance, activation=activation)
+            r_mult = state.get("trailing_r_mult", "?")
+            log.info("Trailing stop activated for %s: %.2f USDT (%sR), activation=%s",
+                     symbol, distance, r_mult, activation)
+            self.notify(f"↗️ Trailing active on {symbol}: −${distance:,.0f} ({r_mult}R)")
+            return True
+        except Exception as e:
+            log.warning("Failed to activate trailing for %s: %s", symbol, e)
+            return False
 
     def handle_sl_fill(self, symbol: str, source: str = "SL"):
         with self._lock:
@@ -347,6 +402,7 @@ class TradeManager:
             self.db.delete(symbol)
 
         try:
+            self.bybit.cancel_trailing_stop(symbol)
             self.bybit.cancel_all(symbol)
             position = self.bybit.get_open_position(symbol)
             if position and float(position.get("size", 0)) > 0:
@@ -368,6 +424,15 @@ class TradeManager:
             state = self.db.get(symbol)
             if state and state["entry_price"] == 0 and avg_price > 0:
                 self.db.upsert(symbol, entry_price=avg_price)
+                # Trailing: calculate distance from fill price if r_mult is set
+                if state.get("trailing_r_mult") and not state.get("trailing_distance"):
+                    r_mult = float(state["trailing_r_mult"])
+                    sl_price = state.get("sl_price", 0)
+                    if sl_price > 0 and r_mult > 0:
+                        risk = abs(avg_price - sl_price)
+                        td = round(risk * r_mult, 2)
+                        if td > 0:
+                            self.db.upsert(symbol, trailing_distance=td)
                 # Only check SL breach on the initial entry fill (not DCA fills)
                 sl_price = state.get("sl_price", 0)
                 pos_side = state.get("position", "")
@@ -383,6 +448,53 @@ class TradeManager:
                         self.handle_sl_fill(symbol, "SL")
                         return
         self.sync_protective_orders(symbol)
+
+    # ---------- trailing stop ----------
+
+    def cancel_trailing(self, symbol: str) -> str:
+        state = self.db.get(symbol)
+        if not state or state["status"] != "active":
+            return f"No active position for {symbol}."
+        if not state.get("trailing_distance"):
+            return f"No trailing stop active on {symbol}."
+
+        self.bybit.cancel_trailing_stop(symbol)
+        original_sl = state.get("original_sl_price")
+        self.db.upsert(symbol, trailing_distance=None, trailing_r_mult=None)
+        if original_sl and float(original_sl) > 0:
+            self.db.upsert(symbol, sl_price=float(original_sl))
+            self.sync_protective_orders(symbol)
+            return f"Trailing cancelled for {symbol}. SL restored to {original_sl}."
+        return f"Trailing cancelled for {symbol}."
+
+    def stage_modify_trail(self, symbol: str, mult: float) -> str:
+        state = self.db.get(symbol)
+        if not state or state["status"] != "active":
+            raise ValueError(f"No active position for {symbol}.")
+        if not state.get("breakeven_moved"):
+            raise ValueError(
+                f"Trailing can only be set after breakeven for {symbol}. "
+                f"Close at least one TP first."
+            )
+        entry = state["entry_price"]
+        original_sl = state.get("original_sl_price", 0)
+        if entry <= 0 or float(original_sl) <= 0:
+            raise ValueError(f"Cannot determine R (entry={entry}, original_sl={original_sl})")
+        risk = abs(entry - float(original_sl))
+        td = round(risk * mult, 2)
+        prompt = (
+            f"Set trailing stop for {symbol}?\n"
+            f"  R (entry − original SL): ${risk:,.0f}\n"
+            f"  Multiplier: {mult}R\n"
+            f"  Distance: ${td:,.0f} retracement from peak"
+        )
+        with self._lock:
+            self.pending_mods[symbol] = {
+                "type": "trail",
+                "params": {"distance": td, "r_mult": mult},
+                "chat_id": None, "message_id": None,
+            }
+        return prompt
 
     # ---------- modification commands (sl, tp, dca, entry) ----------
 
@@ -475,6 +587,9 @@ class TradeManager:
             return f"No active position for {symbol}."
 
         if mod_type == "sl":
+            if state.get("trailing_distance"):
+                self.bybit.cancel_trailing_stop(symbol)
+                self.db.upsert(symbol, trailing_distance=None, trailing_r_mult=None)
             self.db.upsert(symbol, sl_price=params["new_price"])
             self.sync_protective_orders(symbol)
             return f"✅ SL updated for {symbol} to {params['new_price']}."
@@ -498,6 +613,14 @@ class TradeManager:
                     self.db.upsert(symbol, dca_order_id=dca_order["result"]["orderId"], dca_price=dca_price)
                     return f"✅ DCA placed for {symbol} at {dca_price} (qty ~{dca_qty})."
             return f"✅ DCA removed for {symbol}."
+
+        elif mod_type == "trail":
+            distance = params["distance"]
+            r_mult = params["r_mult"]
+            self.db.upsert(symbol, trailing_distance=distance, trailing_r_mult=r_mult)
+            if state.get("breakeven_moved"):
+                self._activate_trailing_if_needed(symbol)
+            return f"✅ Trailing stop set for {symbol}: −${distance:,.0f} ({r_mult}R)."
 
         return f"Unknown modification type: {mod_type}"
 
@@ -535,13 +658,18 @@ class TradeManager:
             tps = ", ".join(str(t) for t in tp_raw) if tp_raw else "none"
             dca_info = f"\n  DCA: {state['dca_price']}" if state.get("dca_price") else ""
             be = " ✓" if state.get("breakeven_moved") else ""
+            trail_info = ""
+            if state.get("trailing_distance") and state.get("breakeven_moved"):
+                dist = float(state["trailing_distance"])
+                r_mult = state.get("trailing_r_mult")
+                trail_info = f"\n  Trailing: −${dist:,.0f} from peak" + (f" ({r_mult}R)" if r_mult else "")
 
             lines.append(
                 f"\n{sym} {side}{be}"
                 f"\n  Entry: {entry:,.1f} | Mark: {mark:,.1f}"
                 f"\n  PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)"
                 f"\n  SL: {sl} | TP: {tps}"
-                f"{dca_info}"
+                f"{dca_info}{trail_info}"
             )
 
         return "\n".join(lines)
