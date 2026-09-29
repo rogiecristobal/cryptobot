@@ -7,6 +7,7 @@ import logging
 import os
 import ssl
 import sys
+import threading
 import time
 
 import requests
@@ -71,12 +72,14 @@ async def _handle_manual_tp(symbol: str, trade_manager: TradeManager, tg_app, db
         await asyncio.sleep(config.BREAKEVEN_TIMEOUT_SECONDS)
         state = db.get(symbol)
         if state and state.get("breakeven_prompt_msg_id") == msg.message_id:
-            trade_manager.apply_breakeven(symbol)
+            ok = await asyncio.to_thread(trade_manager.apply_breakeven, symbol)
+            text = (f"⏱️ Timeout — SL auto-moved to entry for {symbol}." if ok
+                    else f"⏱️ Timeout — tried to move SL to entry for {symbol} but it FAILED. Check Bybit.")
             try:
                 await tg_app.bot.edit_message_text(
                     chat_id=config.TELEGRAM_CHAT_ID,
                     message_id=msg.message_id,
-                    text=f"⏱️ Timeout — SL auto-moved to entry for {symbol}.",
+                    text=text,
                 )
             except Exception:
                 pass
@@ -89,16 +92,22 @@ async def _handle_fill_async(item: dict, states: dict, trade_manager: TradeManag
     symbol = item.get("symbol")
     status = item.get("orderStatus")
     order_id = item.get("orderId")
-    if status != "Filled":
+    if status not in ("Filled", "PartiallyFilled"):
         return
 
-    state = states.get(symbol) if states else db.get(symbol)
+    state = states.get(symbol) or db.get(symbol)
     if not state:
+        log.info("Fill for untracked symbol %s (%s %s) — ignored", symbol, order_id, status)
         return
 
-    if order_id == state["entry_order_id"] or order_id == state["dca_order_id"]:
-        log.info("Entry/DCA fill: %s %s", symbol, order_id)
+    if order_id in (state["entry_order_id"], state["dca_order_id"]) or not item.get("reduceOnly"):
+        # Any position-increasing fill on a tracked symbol. Matching on
+        # reduceOnly too covers a fill that lands before confirm() has stored
+        # the order ID. Partial fills count: the filled part needs its SL now.
+        log.info("Entry/DCA fill: %s %s (%s)", symbol, order_id, status)
         await asyncio.to_thread(trade_manager.handle_entry_or_dca_fill, symbol)
+    elif status != "Filled":
+        return
     elif item.get("reduceOnly") and state["status"] == "active":
         order_type = item.get("orderType", "")
         if order_type == "Market":
@@ -122,11 +131,98 @@ async def _handle_position_close(symbol: str, trade_manager: TradeManager, db: S
     """Check and handle position closure from the event loop thread so db.get()
     sees the state after any simultaneous order handler has deleted it."""
     state = db.get(symbol)
-    if state and state["status"] == "active":
+    # Before the first fill a limit entry is still resting and size is 0 —
+    # Bybit also pushes size-0 updates for leverage/margin changes. Only a
+    # position that actually opened can "close".
+    if state and state["status"] == "active" and state.get("position_opened"):
         await asyncio.to_thread(trade_manager.handle_sl_fill, symbol, "Position")
 
 
+_last_position_sync = {}
+
+
+async def _handle_position_open(item: dict, trade_manager: TradeManager, db: StateDB):
+    """Backup path for SL: a position update showing size > 0 with no SL
+    triggers the fill handler, even if the order event was missed."""
+    symbol = item.get("symbol")
+    now = time.time()
+    if now - _last_position_sync.get(symbol, 0) < 5:
+        return
+    state = db.get(symbol)
+    if not state or state["status"] != "active":
+        return
+    has_sl = float(item.get("stopLoss") or 0) > 0
+    if not state.get("position_opened") or not has_sl:
+        _last_position_sync[symbol] = now
+        log.info("Position update for %s: size=%s stopLoss=%r opened=%s — syncing",
+                 symbol, item.get("size"), item.get("stopLoss"), state.get("position_opened"))
+        await asyncio.to_thread(trade_manager.handle_entry_or_dca_fill, symbol)
+
+
+def _log_startup_diagnostics():
+    import platform
+    from importlib import metadata
+
+    def ver(pkg):
+        try:
+            return metadata.version(pkg)
+        except metadata.PackageNotFoundError:
+            return "not installed"
+
+    log.info("Python %s on %s (%s)", sys.version.split()[0], platform.platform(), platform.machine())
+    log.info("Libraries: pybit=%s python-telegram-bot=%s requests=%s websocket-client=%s certifi=%s",
+             ver("pybit"), ver("python-telegram-bot"), ver("requests"), ver("websocket-client"), ver("certifi"))
+    log.info("CWD=%s  DB=%s", os.getcwd(), config.DB_PATH)
+    log.info("Config: category=%s risk=%s%% dca_split=%s leverage=%s margin=%s confirm_timeout=%ss "
+             "breakeven_timeout=%ss watchdog=%ss ws_retries=%s",
+             config.BYBIT_CATEGORY, config.RISK_PERCENT, config.DCA_SPLIT_RATIO, config.DEFAULT_LEVERAGE,
+             config.DEFAULT_MARGIN_MODE, config.CONFIRM_TIMEOUT_SECONDS, config.BREAKEVEN_TIMEOUT_SECONDS,
+             config.WATCHDOG_INTERVAL_SECONDS, BybitClient.WS_RETRIES or "infinite")
+    log.info("System clock: %s (epoch %.0f) — Bybit rejects requests if this drifts", time.strftime("%Y-%m-%d %H:%M:%S %z"), time.time())
+
+
+def _start_watchdog(bybit: BybitClient, trade_manager: TradeManager, notify):
+    """Background thread: re-checks every trade against Bybit and revives a dead WebSocket."""
+    ws_down_since = [None]
+    restarting = threading.Event()
+
+    def restart_ws():
+        try:
+            log.warning("Restarting Bybit private WebSocket...")
+            bybit.restart_private_ws()
+            log.info("Bybit private WebSocket restarted")
+            notify("🔌 Bybit connection restored. Positions re-checked.")
+            trade_manager.ensure_protection()
+        except Exception as e:
+            log.error("WebSocket restart failed: %s", e)
+        finally:
+            restarting.clear()
+
+    def run():
+        while True:
+            time.sleep(config.WATCHDOG_INTERVAL_SECONDS)
+            try:
+                if bybit.ws_is_healthy():
+                    ws_down_since[0] = None
+                elif ws_down_since[0] is None:
+                    ws_down_since[0] = time.time()
+                    log.warning("Bybit private WebSocket is down")
+                elif time.time() - ws_down_since[0] > 60 and not restarting.is_set():
+                    notify("⚠️ Bybit live connection was down >60s — fills may have been missed. Reconnecting; "
+                           "watchdog keeps checking SLs meanwhile.")
+                    ws_down_since[0] = time.time()
+                    restarting.set()
+                    threading.Thread(target=restart_ws, daemon=True, name="ws-restart").start()
+                trade_manager.ensure_protection()
+            except Exception as e:
+                log.exception("Watchdog iteration failed: %s", e)
+
+    threading.Thread(target=run, daemon=True, name="watchdog").start()
+    log.info("Watchdog started (every %ss)", config.WATCHDOG_INTERVAL_SECONDS)
+
+
 def main():
+    _log_startup_diagnostics()
     bybit = BybitClient()
     db = StateDB()
 
@@ -178,30 +274,44 @@ def main():
         return result
     trade_manager.stage_signal = _patched_stage
 
+    # These run on pybit's WebSocket thread. An exception escaping them makes
+    # pybit shut the socket down for good, so they must never raise.
     def on_order_update(msg):
-        items = msg.get("data", [])
-        if not items:
-            return
-        symbols = [item.get("symbol") for item in items if item.get("symbol")]
-        states = db.get_many(symbols) if symbols else {}
-        for item in items:
-            _fire_and_forget(
-                _handle_fill_async(item, states, trade_manager, tg_app, db, loop),
-                loop,
-            )
-
-    def on_position_update(msg):
-        for item in msg.get("data", []):
-            symbol = item.get("symbol")
-            size = float(item.get("size", 0))
-            if size == 0:
-                log.info("Position fully closed on %s (position update)", symbol)
+        try:
+            items = msg.get("data", [])
+            if not items:
+                return
+            symbols = [item.get("symbol") for item in items if item.get("symbol")]
+            states = db.get_many(symbols) if symbols else {}
+            for item in items:
                 _fire_and_forget(
-                    _handle_position_close(symbol, trade_manager, db),
+                    _handle_fill_async(item, states, trade_manager, tg_app, db, loop),
                     loop,
                 )
+        except Exception:
+            log.exception("on_order_update failed for message: %s", msg)
+
+    def on_position_update(msg):
+        try:
+            for item in msg.get("data", []):
+                symbol = item.get("symbol")
+                size = float(item.get("size") or 0)
+                if size == 0:
+                    log.info("Position size 0 on %s (position update)", symbol)
+                    _fire_and_forget(
+                        _handle_position_close(symbol, trade_manager, db),
+                        loop,
+                    )
+                else:
+                    _fire_and_forget(
+                        _handle_position_open(item, trade_manager, db),
+                        loop,
+                    )
+        except Exception:
+            log.exception("on_position_update failed for message: %s", msg)
 
     bybit.start_private_ws(on_order=on_order_update, on_position=on_position_update)
+    _start_watchdog(bybit, trade_manager, notify)
     log.info("Bybit private WebSocket connected. Starting Telegram polling...")
     try:
         tg_app.run_polling(bootstrap_retries=-1)

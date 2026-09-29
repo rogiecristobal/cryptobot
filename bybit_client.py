@@ -5,6 +5,7 @@ All Bybit-specific calls live here so trade_manager.py stays exchange-agnostic-i
 import functools
 import time
 import logging
+import uuid
 from decimal import Decimal
 from pybit.unified_trading import HTTP, WebSocket
 import config
@@ -191,15 +192,7 @@ class BybitClient:
 
     # ---------- orders ----------
 
-    @_retry()
-    def place_market_order(self, symbol: str, side: str, qty: float, reduce_only=False,
-                           stop_loss: float | None = None,
-                           take_profit: float | None = None):
-        symbol = self._norm(symbol)
-        body = dict(
-            category=self.category, symbol=symbol, side=side,
-            orderType="Market", qty=self._fmt_qty(symbol, qty), reduceOnly=reduce_only,
-        )
+    def _add_tpsl(self, body: dict, symbol: str, stop_loss: float | None, take_profit: float | None):
         has_tpsl = False
         if stop_loss is not None:
             body["stopLoss"] = self._fmt_price(symbol, stop_loss)
@@ -213,9 +206,65 @@ class BybitClient:
             has_tpsl = True
         if has_tpsl:
             body["tpslMode"] = "Full"
-        return self.http.place_order(**body)
 
-    @_retry()
+    def find_order(self, symbol: str, order_link_id: str) -> dict | None:
+        """Look an order up by orderLinkId in open orders, then in order history."""
+        symbol = self._norm(symbol)
+        for fetch in (self.http.get_open_orders, self.http.get_order_history):
+            try:
+                resp = fetch(category=self.category, symbol=symbol, orderLinkId=order_link_id)
+                orders = resp["result"]["list"]
+                if orders:
+                    return orders[0]
+            except Exception as e:
+                log.warning("Order lookup (%s) failed for %s: %s", fetch.__name__, order_link_id, e)
+        return None
+
+    def _place_order_once(self, body: dict, max_attempts: int = 3):
+        """
+        Place an order with a client-side orderLinkId so a retry can never
+        create a second order: if a timed-out request actually reached Bybit,
+        the retry is rejected as a duplicate (or found by lookup) and the
+        original order is returned instead of placing another one.
+        """
+        link_id = uuid.uuid4().hex
+        body["orderLinkId"] = link_id
+        symbol = body["symbol"]
+        for attempt in range(max_attempts):
+            try:
+                return self.http.place_order(**body)
+            except Exception as e:
+                msg = str(e).lower()
+                code = getattr(e, "status_code", None)
+                if code == 110072 or "duplicate" in msg:
+                    existing = self.find_order(symbol, link_id)
+                    if existing:
+                        log.warning("Order %s already accepted by Bybit — not placing again", link_id)
+                        return {"result": {"orderId": existing["orderId"], "orderLinkId": link_id}}
+                    raise
+                transient = any(s in msg for s in ("timeout", "timed out", "rate limit",
+                                                   "too many requests", "connection", "ssl"))
+                if not transient or attempt == max_attempts - 1:
+                    raise
+                existing = self.find_order(symbol, link_id)
+                if existing:
+                    log.warning("Order %s reached Bybit despite error (%s) — not placing again", link_id, e)
+                    return {"result": {"orderId": existing["orderId"], "orderLinkId": link_id}}
+                log.warning("Retrying place_order %s after: %s (attempt %d/%d)",
+                            link_id, e, attempt + 1, max_attempts)
+                time.sleep(attempt + 1)
+
+    def place_market_order(self, symbol: str, side: str, qty: float, reduce_only=False,
+                           stop_loss: float | None = None,
+                           take_profit: float | None = None):
+        symbol = self._norm(symbol)
+        body = dict(
+            category=self.category, symbol=symbol, side=side,
+            orderType="Market", qty=self._fmt_qty(symbol, qty), reduceOnly=reduce_only,
+        )
+        self._add_tpsl(body, symbol, stop_loss, take_profit)
+        return self._place_order_once(body)
+
     def place_limit_order(self, symbol: str, side: str, qty: float, price: float, reduce_only=False,
                           stop_loss: float | None = None,
                           take_profit: float | None = None):
@@ -225,25 +274,35 @@ class BybitClient:
             orderType="Limit", qty=self._fmt_qty(symbol, qty), price=self._fmt_price(symbol, price),
             timeInForce="GTC", reduceOnly=reduce_only,
         )
-        has_tpsl = False
-        if stop_loss is not None:
-            body["stopLoss"] = self._fmt_price(symbol, stop_loss)
-            body["slTriggerBy"] = "MarkPrice"
-            body["slOrderType"] = "Market"
-            has_tpsl = True
-        if take_profit is not None:
-            body["takeProfit"] = self._fmt_price(symbol, take_profit)
-            body["tpTriggerBy"] = "MarkPrice"
-            body["tpOrderType"] = "Market"
-            has_tpsl = True
-        if has_tpsl:
-            body["tpslMode"] = "Full"
-        return self.http.place_order(**body)
+        self._add_tpsl(body, symbol, stop_loss, take_profit)
+        return self._place_order_once(body)
+
+    def get_open_orders(self, symbol: str) -> list:
+        symbol = self._norm(symbol)
+        resp = self.http.get_open_orders(category=self.category, symbol=symbol)
+        return resp["result"]["list"]
+
+    def amend_order_sl(self, symbol: str, order_id: str, sl_price: float):
+        """Change the SL attached to a resting (unfilled) order."""
+        symbol = self._norm(symbol)
+        try:
+            self.http.amend_order(
+                category=self.category, symbol=symbol, orderId=order_id,
+                stopLoss=self._fmt_price(symbol, sl_price), slTriggerBy="MarkPrice",
+            )
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                return
+            raise
 
     @_retry()
     def set_position_sl(self, symbol: str, sl_price: float, trigger_by: str = "MarkPrice",
                         position_idx: int = 0):
+        """Set the position-level SL. Raises on failure so callers can alert."""
         symbol = self._norm(symbol)
+        if sl_price is None or sl_price <= 0:
+            # Bybit treats stopLoss=0 as "remove SL" — never send it by accident.
+            raise ValueError(f"Refusing to set invalid SL {sl_price} on {symbol}")
         try:
             self.http.set_trading_stop(
                 category=self.category, symbol=symbol,
@@ -258,6 +317,7 @@ class BybitClient:
             if "not modified" in msg:
                 return
             log.warning("set_trading_stop failed for %s (idx=%s, sl=%s): %s", symbol, position_idx, sl_price, e)
+            raise
 
     def set_trailing_stop(self, symbol: str, distance: float, activation: float | None = None):
         symbol = self._norm(symbol)
@@ -308,15 +368,43 @@ class BybitClient:
 
     # ---------- websocket (fills / position updates) ----------
 
+    # pybit's default is 10 reconnect attempts, after which it stops for good
+    # while Telegram keeps working — the bot looks alive but never sees fills.
+    WS_RETRIES = 0  # 0 = reconnect forever
+
     def start_private_ws(self, on_order, on_position):
+        self._ws_callbacks = (on_order, on_position)
         self._ws = WebSocket(testnet=False, channel_type="private",
-                              api_key=config.BYBIT_API_KEY, api_secret=config.BYBIT_API_SECRET)
+                              api_key=config.BYBIT_API_KEY, api_secret=config.BYBIT_API_SECRET,
+                              retries=self.WS_RETRIES, restart_on_error=True)
         self._ws.order_stream(callback=on_order)
         self._ws.position_stream(callback=on_position)
+
+    def ws_is_healthy(self) -> bool:
+        """
+        False when the socket is down and pybit is not reconnecting it.
+        pybit only auto-reconnects on three specific error types; any other
+        error (SSL, DNS, network unreachable, ...) makes it exit permanently.
+        """
+        ws = self._ws
+        if ws is None:
+            return False
+        try:
+            if ws.is_connected():
+                return True
+            return bool(getattr(ws, "attempting_connection", False)) and not getattr(ws, "exited", False)
+        except Exception:
+            return False
+
+    def restart_private_ws(self):
+        """Tear down a dead private WebSocket and open a fresh one (blocks until connected)."""
+        on_order, on_position = self._ws_callbacks
+        self.stop_ws()
+        self.start_private_ws(on_order, on_position)
 
     def stop_ws(self):
         if self._ws:
             try:
-                self._ws.close()
+                self._ws.exit()  # pybit's WebSocket has exit(), not close()
             except Exception as e:
                 log.warning("WebSocket close error: %s", e)

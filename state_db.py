@@ -57,6 +57,11 @@ class StateDB:
             ("ALTER TABLE trades ADD COLUMN breakeven_prompt_msg_id INTEGER", "breakeven_prompt_msg_id"),
             ("ALTER TABLE trades ADD COLUMN trailing_distance REAL", "trailing_distance"),
             ("ALTER TABLE trades ADD COLUMN trailing_r_mult REAL", "trailing_r_mult"),
+            # 1 once a fill has actually opened the position. Until then a limit
+            # entry is still resting, so "size 0" does NOT mean "position closed".
+            ("ALTER TABLE trades ADD COLUMN position_opened INTEGER DEFAULT 0", "position_opened"),
+            ("ALTER TABLE trades ADD COLUMN risk_amount REAL", "risk_amount"),
+            ("ALTER TABLE trades ADD COLUMN entry_qty REAL", "entry_qty"),
         ]
         for sql, col in migrations:
             try:

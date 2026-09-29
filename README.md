@@ -50,6 +50,12 @@ python3 main.py
 - Take-profit size is split evenly across however many TPs the signal has.
 - First TP fill → SL is cancelled and replaced at entry price (breakeven).
 - SL fill → all remaining orders for that symbol (DCA, unfilled TPs) are cancelled.
+- The SL is attached to every opening order (market, limit entry, DCA), so Bybit
+  arms it on the fill itself even if the bot is offline at that moment.
+- A watchdog re-checks every trade every `WATCHDOG_INTERVAL_SECONDS` (default 30s):
+  a position with no SL gets it re-applied (with a Telegram alert), fills or
+  closes missed while the WebSocket was down are processed, and a dead Bybit
+  WebSocket is restarted.
 
 ## Known simplifications (read before relying on this)
 
@@ -57,11 +63,10 @@ python3 main.py
   fills right as a DCA fill is being processed, the "cancel + recompute from
   actual position size" pattern in `sync_protective_orders()` is designed to
   self-correct, but it hasn't been stress-tested under real fill timing.
-- **Restarts mid-trade**: state is persisted in SQLite (`data/trades.db`), so
-  a restart won't forget a position exists — but the bot needs to be running
-  to catch fills as they happen. Consider a reconciliation pass on startup
-  (checking Bybit's actual open positions/orders against the DB) before
-  trusting a restart mid-trade — this isn't built yet.
+- **Restarts mid-trade**: state is persisted in SQLite (`data/trades.db`). On
+  startup `reconcile()` compares every tracked trade with Bybit: open positions
+  get their SL re-applied, limit entries still waiting to fill are kept, and
+  trades that closed while offline are cleaned up.
 - **Position mode**: assumes Bybit one-way mode (not hedge mode). If your
   account is in hedge mode, order placement will need `positionIdx` added.
 - **No partial-fill handling on the entry order itself** — it assumes entry

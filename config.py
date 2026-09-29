@@ -44,7 +44,11 @@ BREAKEVEN_TIMEOUT_SECONDS = int(os.getenv("BREAKEVEN_TIMEOUT_SECONDS", "60"))
 if BREAKEVEN_TIMEOUT_SECONDS <= 0:
     raise RuntimeError(f"BREAKEVEN_TIMEOUT_SECONDS must be positive, got {BREAKEVEN_TIMEOUT_SECONDS}")
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "trades.db")
+WATCHDOG_INTERVAL_SECONDS = int(os.getenv("WATCHDOG_INTERVAL_SECONDS", "30"))
+if WATCHDOG_INTERVAL_SECONDS < 5:
+    raise RuntimeError(f"WATCHDOG_INTERVAL_SECONDS must be >= 5, got {WATCHDOG_INTERVAL_SECONDS}")
+
+DB_PATH =os.path.join(os.path.dirname(__file__), "data", "trades.db")
 
 # SSL: ensure Python's SSL context can find CA certificates.
 # Termux restarts can reset SSL_CERT_FILE, causing HTTPS failures.

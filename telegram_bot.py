@@ -466,10 +466,11 @@ def build_app(manager_ref):
                 text=result,
             )
         elif action == "breakeven_yes":
-            trade_manager.apply_breakeven(symbol)
+            ok = await asyncio.to_thread(trade_manager.apply_breakeven, symbol)
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=message_id,
-                text=f"✅ SL moved to entry for {symbol}.",
+                text=(f"✅ SL moved to entry for {symbol}." if ok
+                      else f"⚠️ Could not move SL to entry for {symbol} — check Bybit."),
             )
         elif action == "breakeven_no":
             trade_manager.clear_breakeven_prompt(symbol)
