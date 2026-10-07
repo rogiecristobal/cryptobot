@@ -1,15 +1,18 @@
-# Bybit Signal Trading Bot
+# Bitunix Signal Trading Bot
 
-Pastes a signal into Telegram → you reply ✅ → bot places entry/DCA on Bybit →
+Pastes a signal into Telegram → you reply ✅ → bot places entry/DCA on Bitunix (USDT-M futures) →
 auto-manages SL/TP, moves SL to breakeven after TP1, and cancels everything for
 that asset if SL hits.
 
 ## ⚠️ Before you touch mainnet keys
 
-- This has **not** been live-tested against Bybit (no network access to Bybit
-  from the environment that built it). Read every file, then test with the
-  smallest possible position size first.
-- Give the Bybit API key **trade permissions only** — never withdrawal.
+- The Bitunix client was live-tested with tiny XRP orders (limit + SL, SL
+  amend, cancel, market entry with SL/TP, SL move, flash close, WebSocket
+  events). Bitunix has **no testnet**, so still start with small sizes.
+- Give the Bitunix API key **futures trade permission only** — never
+  withdrawal. If you set an IP whitelist, add the bot's IP.
+- One-way position mode is recommended. Hedge mode also works (verified
+  live), as long as you never hold a long and a short on the same symbol.
 - `.env` holds live secrets. Never commit it. `.gitignore` is already set up
   for that.
 - If your phone/Termux loses network or the process dies, the bot stops
@@ -24,7 +27,7 @@ pip install -r requirements.txt --break-system-packages   # Termux
 # or: pip install -r requirements.txt                     # normal venv
 
 cp .env.example .env
-# fill in BYBIT_API_KEY, BYBIT_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# fill in BITUNIX_API_KEY, BITUNIX_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 ```
 
 Get `TELEGRAM_CHAT_ID` by messaging your bot once, then hitting
@@ -50,12 +53,16 @@ python3 main.py
 - Take-profit size is split evenly across however many TPs the signal has.
 - First TP fill → SL is cancelled and replaced at entry price (breakeven).
 - SL fill → all remaining orders for that symbol (DCA, unfilled TPs) are cancelled.
-- The SL is attached to every opening order (market, limit entry, DCA), so Bybit
-  arms it on the fill itself even if the bot is offline at that moment.
+- The SL is attached to every opening order (market, limit entry, DCA), so Bitunix
+  creates its TP/SL order on the fill itself even if the bot is offline at that moment.
 - A watchdog re-checks every trade every `WATCHDOG_INTERVAL_SECONDS` (default 30s):
   a position with no SL gets it re-applied (with a Telegram alert), fills or
-  closes missed while the WebSocket was down are processed, and a dead Bybit
-  WebSocket is restarted.
+  closes missed while the WebSocket was down are processed, an SL on Bitunix
+  that differs from the bot's is reset, and a dead Bitunix WebSocket is restarted.
+- **Trailing stop is bot-side.** Bitunix has no trailing-stop API, so every
+  `TRAILING_INTERVAL_SECONDS` (default 5s) the bot reads mark price and ratchets
+  the SL to peak − distance. It only trails while the bot is running; if the
+  bot goes offline, the last SL it set stays on Bitunix.
 
 ## Known simplifications (read before relying on this)
 
@@ -64,11 +71,18 @@ python3 main.py
   actual position size" pattern in `sync_protective_orders()` is designed to
   self-correct, but it hasn't been stress-tested under real fill timing.
 - **Restarts mid-trade**: state is persisted in SQLite (`data/trades.db`). On
-  startup `reconcile()` compares every tracked trade with Bybit: open positions
+  startup `reconcile()` compares every tracked trade with Bitunix: open positions
   get their SL re-applied, limit entries still waiting to fill are kept, and
   trades that closed while offline are cleaned up.
-- **Position mode**: assumes Bybit one-way mode (not hedge mode). If your
-  account is in hedge mode, order placement will need `positionIdx` added.
+- **Position mode**: fills are classified by order side (same side as the
+  trade = entry/DCA, opposite = close). Verified in hedge mode too, but holding
+  a long and a short on the same symbol would confuse it.
+- **TP vs SL labels**: Bitunix fill events don't say which trigger fired, so a
+  closing market fill is labelled TP or SL by which price it landed closest to.
+- **Attached TP/SL**: on fill, Bitunix turns the SL (and TP) attached to an
+  entry into separate TP/SL orders sized to that fill. Moving the SL updates
+  all of them; the watchdog tops up coverage if any part of the position has
+  no SL.
 - **No partial-fill handling on the entry order itself** — it assumes entry
   and DCA orders each either fully fill or don't.
 
@@ -78,7 +92,7 @@ python3 main.py
 |---|---|
 | `config.py` | loads `.env`, all tunables in one place |
 | `signal_parser.py` | text → structured signal (same logic as the web formatter) |
-| `bybit_client.py` | all Bybit v5 REST/WebSocket calls |
+| `bitunix_client.py` | all Bitunix futures REST/WebSocket calls; returns normalized dicts |
 | `state_db.py` | SQLite persistence for open trade state |
 | `trade_manager.py` | core lifecycle: stage → confirm → sync protective orders → breakeven → SL-cascade |
 | `telegram_bot.py` | Telegram handlers, chat-ID authorization |

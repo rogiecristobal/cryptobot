@@ -1,5 +1,5 @@
 """
-Entrypoint. Runs the Telegram bot (polling) and the Bybit private WebSocket
+Entrypoint. Runs the Telegram bot (polling) and the Bitunix private WebSocket
 (order/position fills) side by side in one process.
 """
 import asyncio
@@ -16,7 +16,7 @@ import urllib3.exceptions
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import config
-from bybit_client import BybitClient
+from bitunix_client import BitunixClient
 from state_db import StateDB
 from trade_manager import TradeManager
 from telegram_bot import build_app
@@ -74,7 +74,7 @@ async def _handle_manual_tp(symbol: str, trade_manager: TradeManager, tg_app, db
         if state and state.get("breakeven_prompt_msg_id") == msg.message_id:
             ok = await asyncio.to_thread(trade_manager.apply_breakeven, symbol)
             text = (f"⏱️ Timeout — SL auto-moved to entry for {symbol}." if ok
-                    else f"⏱️ Timeout — tried to move SL to entry for {symbol} but it FAILED. Check Bybit.")
+                    else f"⏱️ Timeout — tried to move SL to entry for {symbol} but it FAILED. Check Bitunix.")
             try:
                 await tg_app.bot.edit_message_text(
                     chat_id=config.TELEGRAM_CHAT_ID,
@@ -87,41 +87,41 @@ async def _handle_manual_tp(symbol: str, trade_manager: TradeManager, tg_app, db
     asyncio.get_event_loop().create_task(_auto_breakeven())
 
 
-async def _handle_fill_async(item: dict, states: dict, trade_manager: TradeManager, tg_app, db: StateDB, loop):
-    """Async wrapper for fill handling, offloads blocking work via to_thread."""
-    symbol = item.get("symbol")
-    status = item.get("orderStatus")
-    order_id = item.get("orderId")
-    if status not in ("Filled", "PartiallyFilled"):
+FILL_STATUSES = ("FILLED", "PART_FILLED", "PART_FILLED_CANCELED")
+
+
+async def _handle_fill_async(item: dict, state: dict | None, trade_manager: TradeManager, tg_app, db: StateDB):
+    """Async wrapper for fill handling, offloads blocking work via to_thread.
+    item is a normalized order event from BitunixClient."""
+    symbol = item["symbol"]
+    status = item["status"]
+    order_id = item["order_id"]
+    if status not in FILL_STATUSES:
         return
 
-    state = states.get(symbol) or db.get(symbol)
+    state = state or db.get(symbol)
     if not state:
         log.info("Fill for untracked symbol %s (%s %s) — ignored", symbol, order_id, status)
         return
 
-    if order_id in (state["entry_order_id"], state["dca_order_id"]) or not item.get("reduceOnly"):
-        # Any position-increasing fill on a tracked symbol. Matching on
-        # reduceOnly too covers a fill that lands before confirm() has stored
-        # the order ID. Partial fills count: the filled part needs its SL now.
+    # Bitunix order pushes carry no reduceOnly flag or trigger direction, so a
+    # fill is classified by its side: same side as the trade opens/adds to it,
+    # opposite side closes it. Assumes one-way position mode (checked at startup).
+    opening_side = "BUY" if state["position"] == "LONG" else "SELL"
+    if order_id in (state["entry_order_id"], state["dca_order_id"]) or item["side"] == opening_side:
+        # Any position-increasing fill on a tracked symbol. Matching on side
+        # too covers a fill that lands before confirm() has stored the order
+        # ID. Partial fills count: the filled part needs its SL now.
         log.info("Entry/DCA fill: %s %s (%s)", symbol, order_id, status)
         await asyncio.to_thread(trade_manager.handle_entry_or_dca_fill, symbol)
-    elif status != "Filled":
+    elif status != "FILLED":
         return
-    elif item.get("reduceOnly") and state["status"] == "active":
-        order_type = item.get("orderType", "")
-        if order_type == "Market":
-            td = item.get("triggerDirection")
-            is_native_tp = (
-                (state["position"] == "LONG" and td == 1)
-                or (state["position"] == "SHORT" and td == 2)
-            ) if td else False
-            if is_native_tp:
-                log.info("Native TP fill detected: %s %s", symbol, order_id)
-                await asyncio.to_thread(trade_manager.handle_sl_fill, symbol, "TP")
-            else:
-                log.info("SL fill detected: %s %s", symbol, order_id)
-                await asyncio.to_thread(trade_manager.handle_sl_fill, symbol)
+    elif state["status"] == "active":
+        if item["order_type"] == "MARKET":
+            # TP/SL triggers execute as market orders on Bitunix.
+            source = await asyncio.to_thread(trade_manager.classify_exit, symbol, item["avg_price"])
+            log.info("%s fill detected: %s %s at %s", source, symbol, order_id, item["avg_price"])
+            await asyncio.to_thread(trade_manager.handle_sl_fill, symbol, source)
         else:
             log.info("Manual TP fill detected: %s %s", symbol, order_id)
             await _handle_manual_tp(symbol, trade_manager, tg_app, db)
@@ -132,30 +132,33 @@ async def _handle_position_close(symbol: str, trade_manager: TradeManager, db: S
     sees the state after any simultaneous order handler has deleted it."""
     state = db.get(symbol)
     # Before the first fill a limit entry is still resting and size is 0 —
-    # Bybit also pushes size-0 updates for leverage/margin changes. Only a
+    # Bitunix also pushes size-0 updates for leverage/margin changes. Only a
     # position that actually opened can "close".
     if state and state["status"] == "active" and state.get("position_opened"):
-        await asyncio.to_thread(trade_manager.handle_sl_fill, symbol, "Position")
+        source = trade_manager.exchange.recent_trigger(symbol) or "Position close"
+        if source == "SL" and state.get("trailing_distance") and state.get("breakeven_moved"):
+            source = "Trailing SL"
+        await asyncio.to_thread(trade_manager.handle_sl_fill, symbol, source)
 
 
 _last_position_sync = {}
 
 
 async def _handle_position_open(item: dict, trade_manager: TradeManager, db: StateDB):
-    """Backup path for SL: a position update showing size > 0 with no SL
-    triggers the fill handler, even if the order event was missed."""
-    symbol = item.get("symbol")
+    """Backup path for SL: a position that opened (or grew) runs the fill
+    handler, even if the order event was missed. Bitunix position pushes
+    don't include the SL, so the handler checks it over REST."""
+    symbol = item["symbol"]
     now = time.time()
     if now - _last_position_sync.get(symbol, 0) < 5:
         return
     state = db.get(symbol)
     if not state or state["status"] != "active":
         return
-    has_sl = float(item.get("stopLoss") or 0) > 0
-    if not state.get("position_opened") or not has_sl:
+    if not state.get("position_opened") or item["event"] == "OPEN":
         _last_position_sync[symbol] = now
-        log.info("Position update for %s: size=%s stopLoss=%r opened=%s — syncing",
-                 symbol, item.get("size"), item.get("stopLoss"), state.get("position_opened"))
+        log.info("Position %s for %s: size=%s opened=%s — syncing",
+                 item["event"], symbol, item["size"], state.get("position_opened"))
         await asyncio.to_thread(trade_manager.handle_entry_or_dca_fill, symbol)
 
 
@@ -170,28 +173,50 @@ def _log_startup_diagnostics():
             return "not installed"
 
     log.info("Python %s on %s (%s)", sys.version.split()[0], platform.platform(), platform.machine())
-    log.info("Libraries: pybit=%s python-telegram-bot=%s requests=%s websocket-client=%s certifi=%s",
-             ver("pybit"), ver("python-telegram-bot"), ver("requests"), ver("websocket-client"), ver("certifi"))
+    log.info("Libraries: python-telegram-bot=%s requests=%s websocket-client=%s certifi=%s",
+             ver("python-telegram-bot"), ver("requests"), ver("websocket-client"), ver("certifi"))
     log.info("CWD=%s  DB=%s", os.getcwd(), config.DB_PATH)
-    log.info("Config: category=%s risk=%s%% dca_split=%s leverage=%s margin=%s confirm_timeout=%ss "
-             "breakeven_timeout=%ss watchdog=%ss ws_retries=%s",
-             config.BYBIT_CATEGORY, config.RISK_PERCENT, config.DCA_SPLIT_RATIO, config.DEFAULT_LEVERAGE,
+    log.info("Config: exchange=Bitunix risk=%s%% dca_split=%s leverage=%s margin=%s confirm_timeout=%ss "
+             "breakeven_timeout=%ss watchdog=%ss trailing=%ss",
+             config.RISK_PERCENT, config.DCA_SPLIT_RATIO, config.DEFAULT_LEVERAGE,
              config.DEFAULT_MARGIN_MODE, config.CONFIRM_TIMEOUT_SECONDS, config.BREAKEVEN_TIMEOUT_SECONDS,
-             config.WATCHDOG_INTERVAL_SECONDS, BybitClient.WS_RETRIES or "infinite")
-    log.info("System clock: %s (epoch %.0f) — Bybit rejects requests if this drifts", time.strftime("%Y-%m-%d %H:%M:%S %z"), time.time())
+             config.WATCHDOG_INTERVAL_SECONDS, config.TRAILING_INTERVAL_SECONDS)
+    log.info("System clock: %s (epoch %.0f) — Bitunix rejects requests if this drifts", time.strftime("%Y-%m-%d %H:%M:%S %z"), time.time())
 
 
-def _start_watchdog(bybit: BybitClient, trade_manager: TradeManager, notify):
-    """Background thread: re-checks every trade against Bybit and revives a dead WebSocket."""
+def _log_exchange_diagnostics(exchange: BitunixClient, notify):
+    """Account-side state that explains most Bitunix failures: clock drift, position mode, API access."""
+    drift = exchange.clock_drift_seconds()
+    if drift is not None:
+        log.info("Clock drift vs Bitunix: %+.1fs", drift)
+        if abs(drift) > 5:
+            log.warning("Clock drift %.1fs — signed requests may be rejected (error 10007). Sync the device clock.", drift)
+            notify(f"⚠️ Device clock is {drift:+.0f}s off Bitunix time — orders may be rejected. Sync the clock.")
+    try:
+        mode = exchange.get_position_mode()
+        wallet = exchange.get_wallet_info()
+        log.info("Bitunix account: position_mode=%s balance=%.2f available=%.2f upnl=%.2f",
+                 mode, wallet["equity"], wallet["available"], wallet["unrealized_pnl"])
+        if mode != "ONE_WAY":
+            # Verified live: in hedge mode closing orders still use the opposite side,
+            # so fill routing works. Only holding a long AND a short on one symbol breaks it.
+            log.warning("Bitunix position mode is %s — fine as long as each symbol is held in one direction", mode)
+    except Exception as e:
+        log.error("Bitunix account check failed: %s", e)
+        notify(f"⚠️ Could not read the Bitunix account: {e}\nCheck the API key, its permissions and IP whitelist.")
+
+
+def _start_watchdog(exchange: BitunixClient, trade_manager: TradeManager, notify):
+    """Background thread: re-checks every trade against Bitunix and revives a dead WebSocket."""
     ws_down_since = [None]
     restarting = threading.Event()
 
     def restart_ws():
         try:
-            log.warning("Restarting Bybit private WebSocket...")
-            bybit.restart_private_ws()
-            log.info("Bybit private WebSocket restarted")
-            notify("🔌 Bybit connection restored. Positions re-checked.")
+            log.warning("Restarting Bitunix private WebSocket...")
+            exchange.restart_private_ws()
+            log.info("Bitunix private WebSocket restarted")
+            notify("🔌 Bitunix connection restored. Positions re-checked.")
             trade_manager.ensure_protection()
         except Exception as e:
             log.error("WebSocket restart failed: %s", e)
@@ -202,13 +227,13 @@ def _start_watchdog(bybit: BybitClient, trade_manager: TradeManager, notify):
         while True:
             time.sleep(config.WATCHDOG_INTERVAL_SECONDS)
             try:
-                if bybit.ws_is_healthy():
+                if exchange.ws_is_healthy():
                     ws_down_since[0] = None
                 elif ws_down_since[0] is None:
                     ws_down_since[0] = time.time()
-                    log.warning("Bybit private WebSocket is down")
+                    log.warning("Bitunix private WebSocket is down")
                 elif time.time() - ws_down_since[0] > 60 and not restarting.is_set():
-                    notify("⚠️ Bybit live connection was down >60s — fills may have been missed. Reconnecting; "
+                    notify("⚠️ Bitunix live connection was down >60s — fills may have been missed. Reconnecting; "
                            "watchdog keeps checking SLs meanwhile.")
                     ws_down_since[0] = time.time()
                     restarting.set()
@@ -221,9 +246,23 @@ def _start_watchdog(bybit: BybitClient, trade_manager: TradeManager, notify):
     log.info("Watchdog started (every %ss)", config.WATCHDOG_INTERVAL_SECONDS)
 
 
+def _start_trailing_loop(trade_manager: TradeManager):
+    """Background thread: bot-side trailing stop (Bitunix has no native one)."""
+    def run():
+        while True:
+            time.sleep(config.TRAILING_INTERVAL_SECONDS)
+            try:
+                trade_manager.update_trailing_stops()
+            except Exception as e:
+                log.warning("Trailing iteration failed: %s", e)
+
+    threading.Thread(target=run, daemon=True, name="trailing").start()
+    log.info("Trailing loop started (every %ss)", config.TRAILING_INTERVAL_SECONDS)
+
+
 def main():
     _log_startup_diagnostics()
-    bybit = BybitClient()
+    exchange = BitunixClient()
     db = StateDB()
 
     manager_ref = ManagerRef()
@@ -238,7 +277,7 @@ def main():
             loop,
         )
 
-    trade_manager = TradeManager(bybit, db, notify)
+    trade_manager = TradeManager(exchange, db, notify)
     manager_ref.tm = trade_manager
 
     # Reconcile active positions on startup
@@ -274,52 +313,53 @@ def main():
         return result
     trade_manager.stage_signal = _patched_stage
 
-    # These run on pybit's WebSocket thread. An exception escaping them makes
-    # pybit shut the socket down for good, so they must never raise.
-    def on_order_update(msg):
+    _log_exchange_diagnostics(exchange, notify)
+
+    # These run on the Bitunix WebSocket thread and receive one normalized
+    # event each (see bitunix_client.py). They must never raise.
+    def on_order_update(item):
         try:
-            items = msg.get("data", [])
-            if not items:
+            if not item.get("symbol"):
                 return
-            symbols = [item.get("symbol") for item in items if item.get("symbol")]
-            states = db.get_many(symbols) if symbols else {}
-            for item in items:
+            # Snapshot state now: a concurrent handler may delete it before the coroutine runs.
+            state = db.get(item["symbol"])
+            _fire_and_forget(
+                _handle_fill_async(item, state, trade_manager, tg_app, db),
+                loop,
+            )
+        except Exception:
+            log.exception("on_order_update failed for event: %s", item)
+
+    def on_position_update(item):
+        try:
+            symbol = item.get("symbol")
+            if not symbol:
+                return
+            if item["size"] == 0:
+                log.info("Position %s on %s (size 0)", item["event"], symbol)
                 _fire_and_forget(
-                    _handle_fill_async(item, states, trade_manager, tg_app, db, loop),
+                    _handle_position_close(symbol, trade_manager, db),
+                    loop,
+                )
+            else:
+                _fire_and_forget(
+                    _handle_position_open(item, trade_manager, db),
                     loop,
                 )
         except Exception:
-            log.exception("on_order_update failed for message: %s", msg)
+            log.exception("on_position_update failed for event: %s", item)
 
-    def on_position_update(msg):
-        try:
-            for item in msg.get("data", []):
-                symbol = item.get("symbol")
-                size = float(item.get("size") or 0)
-                if size == 0:
-                    log.info("Position size 0 on %s (position update)", symbol)
-                    _fire_and_forget(
-                        _handle_position_close(symbol, trade_manager, db),
-                        loop,
-                    )
-                else:
-                    _fire_and_forget(
-                        _handle_position_open(item, trade_manager, db),
-                        loop,
-                    )
-        except Exception:
-            log.exception("on_position_update failed for message: %s", msg)
-
-    bybit.start_private_ws(on_order=on_order_update, on_position=on_position_update)
-    _start_watchdog(bybit, trade_manager, notify)
-    log.info("Bybit private WebSocket connected. Starting Telegram polling...")
+    exchange.start_private_ws(on_order=on_order_update, on_position=on_position_update)
+    _start_watchdog(exchange, trade_manager, notify)
+    _start_trailing_loop(trade_manager)
+    log.info("Bitunix private WebSocket connected. Starting Telegram polling...")
     try:
         tg_app.run_polling(bootstrap_retries=-1)
     except KeyboardInterrupt:
         pass
     finally:
         log.info("Shutting down...")
-        bybit.stop_ws()
+        exchange.stop_ws()
         db.close()
         logging.shutdown()
 

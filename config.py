@@ -13,9 +13,8 @@ def _required(name: str) -> str:
         raise RuntimeError(f"Missing required env var: {name}. Check your .env file.")
     return val
 
-BYBIT_API_KEY = _required("BYBIT_API_KEY")
-BYBIT_API_SECRET = _required("BYBIT_API_SECRET")
-BYBIT_CATEGORY = os.getenv("BYBIT_CATEGORY", "linear")
+BITUNIX_API_KEY = _required("BITUNIX_API_KEY")
+BITUNIX_API_SECRET = _required("BITUNIX_API_SECRET")
 
 TELEGRAM_BOT_TOKEN = _required("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = int(_required("TELEGRAM_CHAT_ID"))
@@ -48,7 +47,13 @@ WATCHDOG_INTERVAL_SECONDS = int(os.getenv("WATCHDOG_INTERVAL_SECONDS", "30"))
 if WATCHDOG_INTERVAL_SECONDS < 5:
     raise RuntimeError(f"WATCHDOG_INTERVAL_SECONDS must be >= 5, got {WATCHDOG_INTERVAL_SECONDS}")
 
-DB_PATH =os.path.join(os.path.dirname(__file__), "data", "trades.db")
+# Bitunix has no trailing-stop API, so the bot trails the SL itself by
+# polling mark prices at this interval.
+TRAILING_INTERVAL_SECONDS = int(os.getenv("TRAILING_INTERVAL_SECONDS", "5"))
+if TRAILING_INTERVAL_SECONDS < 1:
+    raise RuntimeError(f"TRAILING_INTERVAL_SECONDS must be >= 1, got {TRAILING_INTERVAL_SECONDS}")
+
+DB_PATH = os.path.join(os.path.dirname(__file__), "data", "trades.db")
 
 # SSL: ensure Python's SSL context can find CA certificates.
 # Termux restarts can reset SSL_CERT_FILE, causing HTTPS failures.
@@ -58,3 +63,4 @@ if not os.path.isfile(_ssl_ca_path):
     warnings.warn(f"CA bundle not found at {_ssl_ca_path}, falling back to certifi")
     _ssl_ca_path = certifi.where()
 os.environ.setdefault("SSL_CERT_FILE", _ssl_ca_path)
+SSL_CA_PATH = _ssl_ca_path  # passed explicitly to requests and websocket-client

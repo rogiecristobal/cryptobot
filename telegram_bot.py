@@ -470,7 +470,7 @@ def build_app(manager_ref):
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=message_id,
                 text=(f"✅ SL moved to entry for {symbol}." if ok
-                      else f"⚠️ Could not move SL to entry for {symbol} — check Bybit."),
+                      else f"⚠️ Could not move SL to entry for {symbol} — check Bitunix."),
             )
         elif action == "breakeven_no":
             trade_manager.clear_breakeven_prompt(symbol)

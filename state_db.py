@@ -62,6 +62,8 @@ class StateDB:
             ("ALTER TABLE trades ADD COLUMN position_opened INTEGER DEFAULT 0", "position_opened"),
             ("ALTER TABLE trades ADD COLUMN risk_amount REAL", "risk_amount"),
             ("ALTER TABLE trades ADD COLUMN entry_qty REAL", "entry_qty"),
+            # Best mark price since the bot-side trailing stop engaged (Bitunix has no native one).
+            ("ALTER TABLE trades ADD COLUMN trailing_peak REAL", "trailing_peak"),
         ]
         for sql, col in migrations:
             try:

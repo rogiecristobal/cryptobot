@@ -10,7 +10,7 @@ import threading
 import time
 from typing import Optional, List
 from signal_parser import ParsedSignal
-from bybit_client import BybitClient
+from bitunix_client import BitunixClient
 from state_db import StateDB
 import config
 
@@ -23,8 +23,8 @@ NEW_TRADE_GRACE_SECONDS = 120
 
 
 class TradeManager:
-    def __init__(self, bybit: BybitClient, db: StateDB, notify):
-        self.bybit = bybit
+    def __init__(self, exchange: BitunixClient, db: StateDB, notify):
+        self.exchange = exchange
         self.db = db
         self.notify = notify
         self._lock = threading.Lock()
@@ -58,20 +58,20 @@ class TradeManager:
         entry_id = state.get("entry_order_id")
         if not entry_id:
             return False
-        return any(o.get("orderId") == entry_id for o in self.bybit.get_open_orders(symbol))
+        return any(o["order_id"] == entry_id for o in self.exchange.get_open_orders(symbol))
 
     def _reconcile_symbol(self, symbol: str) -> str:
         state = self.db.get(symbol)
-        pos = self.bybit.get_open_position(symbol)
-        if pos and float(pos.get("size", 0)) > 0:
-            actual_size = float(pos["size"])
+        pos = self.exchange.get_open_position(symbol)
+        if pos and pos["size"] > 0:
+            actual_size = pos["size"]
             updates = {"breakeven_prompt_msg_id": None, "position_opened": 1}
-            if not state.get("entry_price") and float(pos.get("avgPrice", 0)) > 0:
-                updates["entry_price"] = float(pos["avgPrice"])
+            if not state.get("entry_price") and pos["avg_price"] > 0:
+                updates["entry_price"] = pos["avg_price"]
             self.db.upsert(symbol, **updates)
-            log.info("Reconcile %s: size=%s avg=%s exchange_sl=%r trailing=%r db_sl=%s be_moved=%s",
-                     symbol, actual_size, pos.get("avgPrice"), pos.get("stopLoss"),
-                     pos.get("trailingStop"), state.get("sl_price"), state.get("breakeven_moved"))
+            log.info("Reconcile %s: size=%s avg=%s exchange_sl=%s db_sl=%s trailing=%s be_moved=%s",
+                     symbol, actual_size, pos["avg_price"], pos["sl_prices"], state.get("sl_price"),
+                     state.get("trailing_distance"), state.get("breakeven_moved"))
             synced = False
             if state.get("sl_price"):
                 synced = self.sync_protective_orders(symbol)
@@ -83,7 +83,7 @@ class TradeManager:
             if synced:
                 return f"✅ {symbol}: reconciled (size {actual_size}), SL resynced."
             else:
-                return f"⚠️ {symbol}: reconciled (size {actual_size}) but SL could NOT be set — check Bybit."
+                return f"⚠️ {symbol}: reconciled (size {actual_size}) but SL could NOT be set — check Bitunix."
         elif not state.get("position_opened") and self._entry_order_resting(symbol, state):
             # Limit entry still waiting to fill — this is NOT a closed position.
             log.info("Reconcile %s: entry order %s still resting, db_sl=%s",
@@ -92,7 +92,7 @@ class TradeManager:
             return f"⏳ {symbol}: limit entry still waiting to fill — kept."
         else:
             try:
-                self.bybit.cancel_all(symbol)
+                self.exchange.cancel_all(symbol)
             except Exception as e:
                 log.warning("cancel_all failed for %s during reconcile: %s", symbol, e)
             self.db.delete(symbol)
@@ -108,20 +108,20 @@ class TradeManager:
                 log.error("Reconcile failed for %s: %s", symbol, e)
                 messages.append(f"⚠️ {symbol}: could not reconcile ({e}) — watchdog will retry.")
 
-        bybit_positions = self.bybit.get_all_open_positions()
+        exchange_positions = self.exchange.get_all_open_positions()
         db_active = self.db.all_active()
         db_by_norm = {}
         for s in db_active:
             norm = s.replace("/", "").replace(" ", "")
             db_by_norm[norm] = s
 
-        for pos in bybit_positions:
+        for pos in exchange_positions:
             b_sym = pos["symbol"]
             if b_sym not in db_by_norm:
-                side = "LONG" if pos.get("side") == "Buy" else "SHORT"
-                size = float(pos.get("size", 0))
-                entry = float(pos.get("avgPrice", 0))
-                exchange_sl = float(pos.get("stopLoss") or 0)
+                side = pos["side"]
+                size = pos["size"]
+                entry = pos["avg_price"]
+                exchange_sl = pos["stop_loss"]
                 self.db.upsert(
                     b_sym,
                     position=side,
@@ -139,9 +139,9 @@ class TradeManager:
                     dca_price=None,
                 )
                 if exchange_sl > 0:
-                    messages.append(f"⚠️ {b_sym}: orphan position on Bybit — recovered ({side}, {size}), SL {exchange_sl}")
+                    messages.append(f"⚠️ {b_sym}: orphan position on Bitunix — recovered ({side}, {size}), SL {exchange_sl}")
                 else:
-                    messages.append(f"⚠️ {b_sym}: orphan position on Bybit — recovered ({side}, {size}). "
+                    messages.append(f"⚠️ {b_sym}: orphan position on Bitunix — recovered ({side}, {size}). "
                                     f"It has NO stop loss — set one with /sl {b_sym} <price>")
 
         return messages
@@ -153,7 +153,8 @@ class TradeManager:
             raise ValueError("Signal rejected:\n- " + "\n- ".join(signal.errors))
 
         symbol = signal.asset
-        if self.bybit.has_open_orders_or_position(symbol):
+        self.exchange.check_tradable(symbol)
+        if self.exchange.has_open_orders_or_position(symbol):
             raise ValueError(f"{symbol} already has an open position or pending order — new signal rejected.")
 
         # The SL is attached to the DCA order too, so it must sit beyond the DCA.
@@ -164,8 +165,7 @@ class TradeManager:
                 raise ValueError(f"For SHORT, DCA {signal.dca} must be below SL {signal.sl}.")
 
         try:
-            ticker = self.bybit.http.get_tickers(category=config.BYBIT_CATEGORY, symbol=symbol)
-            mark = float(ticker["result"]["list"][0]["markPrice"])
+            mark = self.exchange.get_mark_price(symbol)
         except Exception:
             mark = None
         if mark is not None:
@@ -211,26 +211,25 @@ class TradeManager:
         return "\n".join(lines)
 
     def _calc_qty(self, signal: ParsedSignal):
-        equity = self.bybit.get_equity_usdt()
+        equity = self.exchange.get_equity_usdt()
 
         risk_pct = signal.margin_percent if signal.margin_percent is not None else config.RISK_PERCENT
         risk_amount = equity * (risk_pct / 100)
 
         entry_price = signal.entry
         if signal.entry_is_market:
-            ticker = self.bybit.http.get_tickers(category=config.BYBIT_CATEGORY, symbol=signal.asset)
-            entry_price = float(ticker["result"]["list"][0]["lastPrice"])
+            entry_price = self.exchange.get_last_price(signal.asset)
 
         if signal.dca:
             w_e = config.DCA_SPLIT_RATIO
             w_d = 1 - w_e
             avg_entry = entry_price * w_e + signal.dca * w_d
             total_qty = risk_amount / abs(avg_entry - signal.sl)
-            qty_entry = self.bybit.round_qty(signal.asset, total_qty * w_e)
-            qty_dca = self.bybit.round_qty(signal.asset, total_qty * w_d)
+            qty_entry = self.exchange.round_qty(signal.asset, total_qty * w_e)
+            qty_dca = self.exchange.round_qty(signal.asset, total_qty * w_d)
         else:
             total_qty = risk_amount / abs(entry_price - signal.sl)
-            qty_entry = self.bybit.round_qty(signal.asset, total_qty)
+            qty_entry = self.exchange.round_qty(signal.asset, total_qty)
             qty_dca = 0.0
 
         return qty_entry, qty_dca, risk_amount, equity, risk_pct
@@ -248,8 +247,7 @@ class TradeManager:
 
         # Re-validate SL against current mark price
         try:
-            ticker = self.bybit.http.get_tickers(category=config.BYBIT_CATEGORY, symbol=symbol)
-            mark = float(ticker["result"]["list"][0]["markPrice"])
+            mark = self.exchange.get_mark_price(symbol)
         except Exception:
             mark = None
         if mark is not None:
@@ -259,12 +257,12 @@ class TradeManager:
                 return f"❌ Trade aborted: SL {signal.sl} is now below mark price {mark}."
 
         qty_entry, qty_dca, risk_amount, *_ = entry.get("cached_qty") or self._calc_qty(signal)
-        side = "Buy" if signal.position == "LONG" else "Sell"
+        side = "BUY" if signal.position == "LONG" else "SELL"
 
-        max_lev = self.bybit.get_max_leverage(symbol)
+        max_lev = self.exchange.get_max_leverage(symbol)
         leverage = min(signal.leverage, max_lev)
-        self.bybit.set_margin_mode(symbol, signal.leverage_mode or config.DEFAULT_MARGIN_MODE)
-        self.bybit.set_leverage(symbol, leverage)
+        self.exchange.set_margin_mode(symbol, signal.leverage_mode or config.DEFAULT_MARGIN_MODE)
+        self.exchange.set_leverage(symbol, leverage)
 
         trailing_distance = None
         if signal.trailing_r_mult is not None and not signal.entry_is_market and signal.entry and signal.sl:
@@ -297,29 +295,29 @@ class TradeManager:
         )
 
         # The SL is attached to every opening order (market, limit entry, DCA),
-        # so Bybit arms it on the fill itself — protection no longer depends on
+        # so Bitunix creates its TP/SL order on the fill itself — protection no longer depends on
         # the bot being online and catching the fill event.
         tp = signal.tps[0] if signal.tps else None
         try:
             if signal.entry_is_market:
-                entry_order = self.bybit.place_market_order(symbol, side, qty_entry,
+                entry_order = self.exchange.place_market_order(symbol, side, qty_entry,
                                                             stop_loss=signal.sl, take_profit=tp)
             else:
-                entry_price = self.bybit.round_price(symbol, signal.entry)
-                entry_order = self.bybit.place_limit_order(symbol, side, qty_entry, entry_price,
+                entry_price = self.exchange.round_price(symbol, signal.entry)
+                entry_order = self.exchange.place_limit_order(symbol, side, qty_entry, entry_price,
                                                            stop_loss=signal.sl, take_profit=None)
         except Exception:
             self._cleanup_failed_entry(symbol)
             raise
-        self.db.upsert(symbol, entry_order_id=entry_order["result"]["orderId"])
+        self.db.upsert(symbol, entry_order_id=entry_order)
 
         dca_warning = ""
         if signal.dca and qty_dca > 0:
-            dca_price = self.bybit.round_price(symbol, signal.dca)
+            dca_price = self.exchange.round_price(symbol, signal.dca)
             try:
-                dca_order = self.bybit.place_limit_order(symbol, side, qty_dca, dca_price,
+                dca_order = self.exchange.place_limit_order(symbol, side, qty_dca, dca_price,
                                                          stop_loss=signal.sl, take_profit=None)
-                self.db.upsert(symbol, dca_order_id=dca_order["result"]["orderId"], dca_price=dca_price)
+                self.db.upsert(symbol, dca_order_id=dca_order, dca_price=dca_price)
             except Exception as e:
                 log.error("DCA order failed for %s: %s", symbol, e)
                 dca_warning = (f"\n⚠️ DCA order at {dca_price} FAILED: {e}\n"
@@ -330,16 +328,16 @@ class TradeManager:
         return f"{entry_desc} entry placed for {symbol} with native SL{tp_desc}.{dca_warning}"
 
     def _cleanup_failed_entry(self, symbol: str):
-        """Entry placement raised. Keep tracking if anything reached Bybit anyway."""
+        """Entry placement raised. Keep tracking if anything reached Bitunix anyway."""
         try:
-            exists = self.bybit.has_open_orders_or_position(symbol)
+            exists = self.exchange.has_open_orders_or_position(symbol)
         except Exception as e:
             log.error("Could not verify %s after failed entry: %s", symbol, e)
             exists = True  # can't tell — keep state so the watchdog keeps checking
         if exists:
-            log.error("%s entry call failed but orders/position exist on Bybit — keeping state", symbol)
-            self.notify(f"⚠️ {symbol}: entry request errored but something is live on Bybit. "
-                        f"Bot is still tracking it — check Bybit.")
+            log.error("%s entry call failed but orders/position exist on Bitunix — keeping state", symbol)
+            self.notify(f"⚠️ {symbol}: entry request errored but something is live on Bitunix. "
+                        f"Bot is still tracking it — check Bitunix.")
         else:
             self.db.delete(symbol)
 
@@ -366,26 +364,26 @@ class TradeManager:
         if not ours:
             return
         tol = sl_price * 1e-9
-        for order in self.bybit.get_open_orders(symbol):
-            if order.get("orderId") not in ours:
+        for order in self.exchange.get_open_orders(symbol):
+            if order["order_id"] not in ours:
                 continue
-            current = float(order.get("stopLoss") or 0)
+            current = order["stop_loss"]
             if abs(current - sl_price) > tol:
                 try:
-                    self.bybit.amend_order_sl(symbol, order["orderId"], sl_price)
-                    log.info("Amended resting order %s SL %s -> %s", order["orderId"], current, sl_price)
+                    self.exchange.amend_order_sl(symbol, order, sl_price)
+                    log.info("Amended resting order %s SL %s -> %s", order["order_id"], current, sl_price)
                 except Exception as e:
-                    log.warning("Could not amend SL on resting order %s (%s): %s", order["orderId"], symbol, e)
+                    log.warning("Could not amend SL on resting order %s (%s): %s", order["order_id"], symbol, e)
 
     def sync_protective_orders(self, symbol: str) -> bool:
         """
-        Make Bybit's SL match state. Returns True when the SL is in place (or
+        Make Bitunix's SL match state. Returns True when the SL is in place (or
         there's no position yet), False when it could not be set — in which
         case the user has been alerted.
 
-        The fixed SL is kept even while a trailing stop is configured: Bybit
-        runs both side by side, and before the trailing stop activates the
-        fixed SL is the only protection.
+        Bitunix has no native trailing stop: update_trailing_stops() ratchets
+        sl_price in the DB and calls this, so the SL on Bitunix is always the
+        one in state.
         """
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
@@ -394,7 +392,7 @@ class TradeManager:
         if raw_sl <= 0:
             log.warning("%s has no SL on record — nothing to sync", symbol)
             return False
-        sl_price = self.bybit.round_price(symbol, raw_sl)
+        sl_price = self.exchange.round_price(symbol, raw_sl)
 
         try:
             self._sync_resting_order_sl(symbol, state, sl_price)
@@ -402,16 +400,16 @@ class TradeManager:
             log.warning("Resting-order SL sync failed for %s: %s", symbol, e)
 
         try:
-            position = self.bybit.get_open_position(symbol)
+            position = self.exchange.get_open_position(symbol)
             if not position:
                 return True
-            self.bybit.set_position_sl(symbol, sl_price, position_idx=0)
+            self.exchange.set_position_sl(symbol, sl_price)
             return True
         except Exception as e:
             log.error("Failed to set SL %s on %s: %s", sl_price, symbol, e)
             self._alert(f"sl_fail:{symbol}",
                         f"⚠️ Could not set SL {sl_price} on {symbol}: {e}\n"
-                        f"The position may be UNPROTECTED — check Bybit. Bot will keep retrying.")
+                        f"The position may be UNPROTECTED — check Bitunix. Bot will keep retrying.")
             return False
 
     def handle_tp_fill(self, symbol: str, filled_order_id: str):
@@ -450,7 +448,7 @@ class TradeManager:
         else:
             self.notify(f"🎯 Another TP hit on {symbol} — SL resynced to remaining size.")
 
-    # ---------- manual TP detection (user places TPs on Bybit UI) ----------
+    # ---------- manual TP detection (user places TPs on Bitunix UI) ----------
 
     def handle_manual_tp_fill(self, symbol: str) -> int:
         state = self.db.get(symbol)
@@ -489,7 +487,7 @@ class TradeManager:
         if ok:
             self.notify(f"✅ SL moved to entry ({new_sl}) for {symbol}.")
         else:
-            self.notify(f"⚠️ Failed to move SL to entry ({new_sl}) for {symbol} — check Bybit.")
+            self.notify(f"⚠️ Failed to move SL to entry ({new_sl}) for {symbol} — check Bitunix.")
         return ok
 
     def clear_breakeven_prompt(self, symbol: str):
@@ -508,16 +506,74 @@ class TradeManager:
         pos = state.get("position", "LONG")
         distance = float(dist)
         activation = entry + distance if pos == "LONG" else entry - distance
-        try:
-            self.bybit.set_trailing_stop(symbol, distance, activation=activation)
-            r_mult = state.get("trailing_r_mult", "?")
-            log.info("Trailing stop activated for %s: %.2f USDT (%sR), activation=%s",
-                     symbol, distance, r_mult, activation)
-            self.notify(f"↗️ Trailing active on {symbol}: −${distance:,.0f} ({r_mult}R)")
-            return True
-        except Exception as e:
-            log.warning("Failed to activate trailing for %s: %s", symbol, e)
-            return False
+        # Bitunix has no trailing-stop API: update_trailing_stops() does the
+        # trailing. This only announces it; the peak is tracked from activation.
+        r_mult = state.get("trailing_r_mult", "?")
+        log.info("Trailing stop armed for %s: %.2f USDT (%sR), activation=%s",
+                 symbol, distance, r_mult, activation)
+        self.notify(f"↗️ Trailing armed on {symbol}: −${distance:,.0f} ({r_mult}R), "
+                    f"starts once price reaches {activation:g}")
+        return True
+
+    def update_trailing_stops(self):
+        """
+        Bot-side trailing stop. Once mark price reaches entry ± distance the
+        peak is tracked and the SL ratcheted to peak ∓ distance — never
+        loosened. Only works while the bot is running; the last SL it set
+        stays on Bitunix if it goes offline.
+        """
+        states = [s for s in (self.db.get(sym) for sym in self.db.all_active())
+                  if s and s.get("position_opened") and s.get("breakeven_moved")
+                  and s.get("trailing_distance") and (s.get("entry_price") or 0) > 0]
+        if not states:
+            return
+        marks = self.exchange.get_mark_prices([s["symbol"] for s in states])
+        for state in states:
+            mark = marks.get(state["symbol"])
+            if not mark:
+                continue
+            try:
+                self._trail_symbol(state, mark)
+            except Exception as e:
+                log.warning("Trailing update failed for %s: %s", state["symbol"], e)
+
+    def _trail_symbol(self, state: dict, mark: float):
+        symbol = state["symbol"]
+        is_long = state["position"] == "LONG"
+        distance = float(state["trailing_distance"])
+        entry = state["entry_price"]
+        peak = state.get("trailing_peak")
+        if peak is None:
+            activation = entry + distance if is_long else entry - distance
+            if (is_long and mark < activation) or (not is_long and mark > activation):
+                return
+            peak = mark
+            self.notify(f"↗️ Trailing engaged on {symbol} at {mark:g}")
+        else:
+            peak = max(peak, mark) if is_long else min(peak, mark)
+        if peak != state.get("trailing_peak"):
+            self.db.upsert(symbol, trailing_peak=peak)
+
+        new_sl = self.exchange.round_price(symbol, peak - distance if is_long else peak + distance)
+        current = state.get("sl_price") or 0
+        tighter = new_sl > current if is_long else (current <= 0 or new_sl < current)
+        if not tighter:
+            return
+        self.db.upsert(symbol, sl_price=new_sl)
+        if self.sync_protective_orders(symbol):
+            log.info("Trailing SL %s: %s -> %s (peak %s)", symbol, current, new_sl, peak)
+
+    def classify_exit(self, symbol: str, fill_price: float) -> str:
+        """Label a closing market fill as TP or SL by which level it landed nearest."""
+        state = self.db.get(symbol)
+        if not state or not fill_price:
+            return "SL"
+        trailing = bool(state.get("trailing_distance") and state.get("breakeven_moved"))
+        sl = state.get("sl_price") or 0
+        tps = self.db.loads(state.get("tp_prices"))
+        if tps and sl > 0 and min(abs(fill_price - t) for t in tps) < abs(fill_price - sl):
+            return "TP"
+        return "Trailing SL" if trailing else "SL"
 
     def handle_sl_fill(self, symbol: str, source: str = "SL"):
         with self._lock:
@@ -527,14 +583,9 @@ class TradeManager:
             self.db.delete(symbol)
 
         try:
-            self.bybit.cancel_trailing_stop(symbol)
-            self.bybit.cancel_all(symbol)
-            position = self.bybit.get_open_position(symbol)
-            if position and float(position.get("size", 0)) > 0:
-                side = position["side"]
-                close_side = "Sell" if side == "Buy" else "Buy"
-                qty = float(position["size"])
-                self.bybit.close_position_market(symbol, close_side, qty)
+            self.exchange.cancel_all(symbol)
+            qty = self.exchange.close_position_market(symbol)
+            if qty > 0:
                 self.notify(f"🛑 {source} triggered on {symbol} — residual detected, force-closed {qty}.")
         except Exception as e:
             log.error("Force-close failed for %s: %s", symbol, e)
@@ -549,7 +600,7 @@ class TradeManager:
         # The REST position can lag the WebSocket fill event by a moment.
         position = None
         for attempt in range(5):
-            position = self.bybit.get_open_position(symbol)
+            position = self.exchange.get_open_position(symbol)
             if position:
                 break
             time.sleep(0.5)
@@ -558,7 +609,7 @@ class TradeManager:
             return
         if not state.get("position_opened"):
             self.db.upsert(symbol, position_opened=1)
-        avg_price = float(position.get("avgPrice", 0))
+        avg_price = position["avg_price"]
         state = self.db.get(symbol)
         if state and state["entry_price"] == 0 and avg_price > 0:
             self.db.upsert(symbol, entry_price=avg_price)
@@ -575,8 +626,7 @@ class TradeManager:
             sl_price = state.get("sl_price", 0)
             pos_side = state.get("position", "")
             try:
-                ticker = self.bybit.http.get_tickers(category=config.BYBIT_CATEGORY, symbol=symbol)
-                mark = float(ticker["result"]["list"][0]["markPrice"])
+                mark = self.exchange.get_mark_price(symbol)
             except Exception:
                 mark = None
             if mark is not None and sl_price > 0:
@@ -591,7 +641,7 @@ class TradeManager:
 
     def ensure_protection(self):
         """
-        Periodic check of every active trade against Bybit. Catches anything
+        Periodic check of every active trade against Bitunix. Catches anything
         the event-driven path missed: dropped fill events, a dead WebSocket,
         a failed SL call, or a close that happened while disconnected.
         """
@@ -605,20 +655,28 @@ class TradeManager:
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
             return
-        pos = self.bybit.get_open_position(symbol)
+        pos = self.exchange.get_open_position(symbol)
 
         if pos:
             if not state.get("position_opened"):
                 log.warning("Watchdog: %s has a position but its fill was never processed — handling now", symbol)
                 self.handle_entry_or_dca_fill(symbol)
                 return
-            if float(pos.get("stopLoss") or 0) > 0:
-                return
             sl = state.get("sl_price") or 0
-            if sl > 0:
-                log.warning("Watchdog: %s position has NO stop loss on Bybit — re-applying %s", symbol, sl)
+            if pos["stop_loss"] > 0:
+                if sl <= 0:
+                    return
+                want = self.exchange.round_price(symbol, sl)
+                if all(abs(p - want) <= want * 1e-9 for p in pos["sl_prices"]):
+                    return
+                log.warning("Watchdog: %s SL on Bitunix %s != state %s — resyncing", symbol, pos["sl_prices"], want)
                 if self.sync_protective_orders(symbol):
-                    self._alert(f"sl_fixed:{symbol}", f"🛡️ {symbol} had no SL on Bybit — re-applied SL at {sl}.")
+                    self._alert(f"sl_drift:{symbol}", f"🛡️ {symbol} SL on Bitunix differed from the bot's — reset to {want}.")
+                return
+            if sl > 0:
+                log.warning("Watchdog: %s position has NO stop loss on Bitunix — re-applying %s", symbol, sl)
+                if self.sync_protective_orders(symbol):
+                    self._alert(f"sl_fixed:{symbol}", f"🛡️ {symbol} had no SL on Bitunix — re-applied SL at {sl}.")
             else:
                 self._alert(f"no_sl:{symbol}",
                             f"⚠️ {symbol} has NO stop loss and none is on record. "
@@ -630,26 +688,26 @@ class TradeManager:
             self.handle_sl_fill(symbol, "Position closed")
             return
 
-        # Not filled yet: is the entry still resting on Bybit?
+        # Not filled yet: is the entry still resting on Bitunix?
         if time.time() - (state.get("created_at") or 0) < NEW_TRADE_GRACE_SECONDS:
             return
-        open_orders = self.bybit.get_open_orders(symbol)
+        open_orders = self.exchange.get_open_orders(symbol)
         entry_id = state.get("entry_order_id")
         if entry_id:
-            resting = any(o.get("orderId") == entry_id for o in open_orders)
+            resting = any(o["order_id"] == entry_id for o in open_orders)
         else:
-            resting = any(not o.get("reduceOnly") for o in open_orders)
+            resting = any(not o["reduce_only"] for o in open_orders)
         if resting:
             return
-        if self.bybit.get_open_position(symbol):
+        if self.exchange.get_open_position(symbol):
             return  # filled between the two calls — next pass handles it
-        log.warning("Watchdog: %s entry order is no longer on Bybit and no position exists — cleaning up", symbol)
+        log.warning("Watchdog: %s entry order is no longer on Bitunix and no position exists — cleaning up", symbol)
         try:
-            self.bybit.cancel_all(symbol)
+            self.exchange.cancel_all(symbol)
         except Exception as e:
             log.warning("cancel_all failed for %s: %s", symbol, e)
         self.db.delete(symbol)
-        self.notify(f"🗑️ {symbol}: entry order is no longer on Bybit (cancelled or rejected) — trade removed.")
+        self.notify(f"🗑️ {symbol}: entry order is no longer on Bitunix (cancelled or rejected) — trade removed.")
 
     # ---------- trailing stop ----------
 
@@ -660,9 +718,8 @@ class TradeManager:
         if not state.get("trailing_distance"):
             return f"No trailing stop active on {symbol}."
 
-        self.bybit.cancel_trailing_stop(symbol)
         original_sl = state.get("original_sl_price")
-        self.db.upsert(symbol, trailing_distance=None, trailing_r_mult=None)
+        self.db.upsert(symbol, trailing_distance=None, trailing_r_mult=None, trailing_peak=None)
         if original_sl and float(original_sl) > 0:
             self.db.upsert(symbol, sl_price=float(original_sl))
             self.sync_protective_orders(symbol)
@@ -718,12 +775,12 @@ class TradeManager:
 
         risk_amount = state.get("risk_amount")
         if not risk_amount:
-            risk_amount = self.bybit.get_equity_usdt() * (config.RISK_PERCENT / 100)
+            risk_amount = self.exchange.get_equity_usdt() * (config.RISK_PERCENT / 100)
 
-        position = self.bybit.get_open_position(symbol)
+        position = self.exchange.get_open_position(symbol)
         if position:
-            size = float(position["size"])
-            avg = float(position.get("avgPrice", 0))
+            size = position["size"]
+            avg = position["avg_price"]
         else:
             size = state.get("entry_qty") or 0
             avg = state.get("entry_price") or 0
@@ -737,7 +794,7 @@ class TradeManager:
                 f"Entry already risks ${used:,.2f} of the ${risk_amount:,.2f} budget — "
                 f"a DCA would exceed your risk. Not placed."
             )
-        qty = self.bybit.round_qty(symbol, remaining / abs(dca_price - sl))
+        qty = self.exchange.round_qty(symbol, remaining / abs(dca_price - sl))
         return qty, remaining, risk_amount
 
     def stage_modify_sl(self, symbol: str, new_sl: float) -> str:
@@ -754,8 +811,7 @@ class TradeManager:
         if new_sl <= 0:
             raise ValueError(f"Invalid SL {new_sl}.")
         try:
-            ticker = self.bybit.http.get_tickers(category=config.BYBIT_CATEGORY, symbol=symbol)
-            mark = float(ticker["result"]["list"][0]["markPrice"])
+            mark = self.exchange.get_mark_price(symbol)
         except Exception:
             mark = None
         if mark is not None:
@@ -832,13 +888,12 @@ class TradeManager:
 
         if mod_type == "sl":
             if state.get("trailing_distance"):
-                self.bybit.cancel_trailing_stop(symbol)
-                self.db.upsert(symbol, trailing_distance=None, trailing_r_mult=None)
+                self.db.upsert(symbol, trailing_distance=None, trailing_r_mult=None, trailing_peak=None)
             self.db.upsert(symbol, sl_price=params["new_price"])
             if self.sync_protective_orders(symbol):
                 return f"✅ SL updated for {symbol} to {params['new_price']}."
-            return (f"⚠️ SL for {symbol} saved as {params['new_price']} but Bybit did NOT accept it — "
-                    f"the old SL may still be active. Check Bybit.")
+            return (f"⚠️ SL for {symbol} saved as {params['new_price']} but Bitunix did NOT accept it — "
+                    f"the old SL may still be active. Check Bitunix.")
 
         elif mod_type == "tp":
             self.db.upsert(symbol, tp_prices=self.db.dumps(params["new_prices"]))
@@ -855,21 +910,21 @@ class TradeManager:
                 except ValueError as e:
                     return f"❌ DCA not changed: {e}"
             if state.get("dca_order_id"):
-                self.bybit.cancel_order(symbol, state["dca_order_id"])
+                self.exchange.cancel_order(symbol, state["dca_order_id"])
             self.db.upsert(symbol, dca_order_id=None, dca_price=None)
             if new_price is not None and dca_qty > 0:
-                side = "Buy" if state["position"] == "LONG" else "Sell"
-                dca_price = self.bybit.round_price(symbol, new_price)
-                dca_order = self.bybit.place_limit_order(symbol, side, dca_qty, dca_price,
+                side = "BUY" if state["position"] == "LONG" else "SELL"
+                dca_price = self.exchange.round_price(symbol, new_price)
+                dca_order = self.exchange.place_limit_order(symbol, side, dca_qty, dca_price,
                                                          stop_loss=state["sl_price"])
-                self.db.upsert(symbol, dca_order_id=dca_order["result"]["orderId"], dca_price=dca_price)
+                self.db.upsert(symbol, dca_order_id=dca_order, dca_price=dca_price)
                 return f"✅ DCA placed for {symbol} at {dca_price} (qty ~{dca_qty}) with SL {state['sl_price']}."
             return f"✅ DCA removed for {symbol}."
 
         elif mod_type == "trail":
             distance = params["distance"]
             r_mult = params["r_mult"]
-            self.db.upsert(symbol, trailing_distance=distance, trailing_r_mult=r_mult)
+            self.db.upsert(symbol, trailing_distance=distance, trailing_r_mult=r_mult, trailing_peak=None)
             if state.get("breakeven_moved"):
                 self._activate_trailing_if_needed(symbol)
             return f"✅ Trailing stop set for {symbol}: −${distance:,.0f} ({r_mult}R)."
@@ -884,7 +939,7 @@ class TradeManager:
     # ---------- status & close ----------
 
     def get_status(self, symbol: Optional[str] = None) -> str:
-        wallet = self.bybit.get_wallet_info()
+        wallet = self.exchange.get_wallet_info()
         lines = [f"📊 Equity: ${wallet['equity']:,.2f} | Available: ${wallet['available']:,.2f}"]
 
         symbols = [symbol] if symbol else self.db.all_active()
@@ -894,16 +949,19 @@ class TradeManager:
 
         for sym in symbols:
             state = self.db.get(sym)
-            pos = self.bybit.get_open_position(sym)
+            pos = self.exchange.get_open_position(sym)
             if not state or not pos:
                 lines.append(f"\n{sym}: no active position")
                 continue
             side = state["position"]
-            entry = state["entry_price"] or float(pos.get("avgPrice", 0))
-            mark = float(pos.get("markPrice", 0))
-            qty = float(pos.get("size", 0))
-            leverage = int(float(pos.get("leverage", 1)))
-            pnl = float(pos.get("unrealisedPnl", 0))
+            entry = state["entry_price"] or pos["avg_price"]
+            try:
+                mark = self.exchange.get_mark_price(sym)
+            except Exception:
+                mark = 0.0
+            qty = pos["size"]
+            leverage = pos["leverage"]
+            pnl = pos["unrealized_pnl"]
             pnl_pct = (pnl / max(entry * qty / leverage, 1e-8)) * 100 if entry > 0 else 0
             sl = state["sl_price"]
             tp_raw = self.db.loads(state.get("tp_prices", "[]"))

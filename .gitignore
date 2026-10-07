@@ -1,5 +1,5 @@
 .env
-data/*.db
+data/*.db*
 logs/*.log
 __pycache__/
 *.pyc
