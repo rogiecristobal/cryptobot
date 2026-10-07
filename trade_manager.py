@@ -69,8 +69,10 @@ class TradeManager:
             if not state.get("entry_price") and pos["avg_price"] > 0:
                 updates["entry_price"] = pos["avg_price"]
             self.db.upsert(symbol, **updates)
-            log.info("Reconcile %s: size=%s avg=%s exchange_sl=%s db_sl=%s trailing=%s be_moved=%s",
+            log.info("Reconcile %s: size=%s avg=%s exchange_sl=%s db_sl=%s exchange_tp=%s db_tp=%s "
+                     "trailing=%s be_moved=%s",
                      symbol, actual_size, pos["avg_price"], pos["sl_prices"], state.get("sl_price"),
+                     pos["tp_prices"], state.get("tp_prices"),
                      state.get("trailing_distance"), state.get("breakeven_moved"))
             synced = False
             if state.get("sl_price"):
@@ -122,6 +124,7 @@ class TradeManager:
                 size = pos["size"]
                 entry = pos["avg_price"]
                 exchange_sl = pos["stop_loss"]
+                exchange_tp = pos["take_profit"]
                 self.db.upsert(
                     b_sym,
                     position=side,
@@ -130,7 +133,7 @@ class TradeManager:
                     entry_price=entry,
                     sl_price=exchange_sl,
                     original_sl_price=exchange_sl,
-                    tp_prices=self.db.dumps([]),
+                    tp_prices=self.db.dumps([exchange_tp] if exchange_tp > 0 else []),
                     breakeven_moved=0,
                     manual_tp_count=0,
                     breakeven_prompt_msg_id=None,
@@ -294,7 +297,7 @@ class TradeManager:
             trailing_r_mult=signal.trailing_r_mult,
         )
 
-        # The SL is attached to every opening order (market, limit entry, DCA),
+        # The SL and TP1 are attached to every opening order (market, limit entry, DCA),
         # so Bitunix creates its TP/SL order on the fill itself — protection no longer depends on
         # the bot being online and catching the fill event.
         tp = signal.tps[0] if signal.tps else None
@@ -305,7 +308,7 @@ class TradeManager:
             else:
                 entry_price = self.exchange.round_price(symbol, signal.entry)
                 entry_order = self.exchange.place_limit_order(symbol, side, qty_entry, entry_price,
-                                                           stop_loss=signal.sl, take_profit=None)
+                                                           stop_loss=signal.sl, take_profit=tp)
         except Exception:
             self._cleanup_failed_entry(symbol)
             raise
@@ -316,7 +319,7 @@ class TradeManager:
             dca_price = self.exchange.round_price(symbol, signal.dca)
             try:
                 dca_order = self.exchange.place_limit_order(symbol, side, qty_dca, dca_price,
-                                                         stop_loss=signal.sl, take_profit=None)
+                                                         stop_loss=signal.sl, take_profit=tp)
                 self.db.upsert(symbol, dca_order_id=dca_order, dca_price=dca_price)
             except Exception as e:
                 log.error("DCA order failed for %s: %s", symbol, e)
@@ -324,7 +327,7 @@ class TradeManager:
                                f"Entry is live with its SL. Retry with /dca {symbol} {dca_price}")
 
         entry_desc = "Market" if signal.entry_is_market else "Limit"
-        tp_desc = " & TP" if tp is not None and signal.entry_is_market else ""
+        tp_desc = f" & TP {tp}" if tp is not None else ""
         return f"{entry_desc} entry placed for {symbol} with native SL{tp_desc}.{dca_warning}"
 
     def _cleanup_failed_entry(self, symbol: str):
@@ -357,29 +360,56 @@ class TradeManager:
             self._last_alert[key] = now
         self.notify(text)
 
-    def _sync_resting_order_sl(self, symbol: str, state: dict, sl_price: float):
-        """Keep the SL attached to unfilled entry/DCA orders equal to the current SL,
-        so a later fill doesn't re-arm a stale SL on the position."""
+    def _target_tp(self, symbol: str, state: dict) -> Optional[float]:
+        """TP1 from state, rounded for Bitunix. Only TP1 is placed on the exchange (it closes the whole position)."""
+        tps = self.db.loads(state.get("tp_prices"))
+        return self.exchange.round_price(symbol, tps[0]) if tps else None
+
+    @staticmethod
+    def _same_price(a: float, b: float) -> bool:
+        return abs(a - b) <= abs(b) * 1e-9
+
+    def _sync_resting_orders(self, symbol: str, state: dict, sl_price: float, tp_price: Optional[float]):
+        """Keep the SL/TP attached to unfilled entry/DCA orders equal to state,
+        so a later fill doesn't re-arm a stale SL or TP on the position."""
         ours = {state.get("entry_order_id"), state.get("dca_order_id")} - {None, ""}
         if not ours:
             return
-        tol = sl_price * 1e-9
         for order in self.exchange.get_open_orders(symbol):
             if order["order_id"] not in ours:
                 continue
-            current = order["stop_loss"]
-            if abs(current - sl_price) > tol:
-                try:
-                    self.exchange.amend_order_sl(symbol, order, sl_price)
-                    log.info("Amended resting order %s SL %s -> %s", order["order_id"], current, sl_price)
-                except Exception as e:
-                    log.warning("Could not amend SL on resting order %s (%s): %s", order["order_id"], symbol, e)
+            sl_ok = self._same_price(order["stop_loss"], sl_price)
+            tp_ok = tp_price is None or self._same_price(order["take_profit"], tp_price)
+            if sl_ok and tp_ok:
+                continue
+            try:
+                self.exchange.amend_order_tpsl(symbol, order, sl_price, tp_price)
+                log.info("Amended resting order %s SL %s -> %s, TP %s -> %s", order["order_id"],
+                         order["stop_loss"], sl_price, order["take_profit"], tp_price)
+            except Exception as e:
+                log.warning("Could not amend SL/TP on resting order %s (%s): %s", order["order_id"], symbol, e)
+
+    def _sync_position_tp(self, symbol: str, state: dict) -> bool:
+        """Put TP1 from state on the open position. Returns False (and alerts) on failure."""
+        tp_price = self._target_tp(symbol, state)
+        if tp_price is None:
+            return True
+        try:
+            self.exchange.set_position_tp(symbol, tp_price)
+            return True
+        except Exception as e:
+            log.error("Failed to set TP %s on %s: %s", tp_price, symbol, e)
+            self._alert(f"tp_fail:{symbol}",
+                        f"⚠️ Could not set TP {tp_price} on {symbol}: {e}\n"
+                        f"SL is unaffected. Bot will keep retrying — or change it with /tp {symbol} <price>.")
+            return False
 
     def sync_protective_orders(self, symbol: str) -> bool:
         """
-        Make Bitunix's SL match state. Returns True when the SL is in place (or
-        there's no position yet), False when it could not be set — in which
-        case the user has been alerted.
+        Make Bitunix's SL and TP1 match state. Returns True when the SL is in
+        place (or there's no position yet), False when it could not be set —
+        in which case the user has been alerted. A TP failure alerts on its
+        own and never blocks the SL.
 
         Bitunix has no native trailing stop: update_trailing_stops() ratchets
         sl_price in the DB and calls this, so the SL on Bitunix is always the
@@ -395,22 +425,47 @@ class TradeManager:
         sl_price = self.exchange.round_price(symbol, raw_sl)
 
         try:
-            self._sync_resting_order_sl(symbol, state, sl_price)
+            self._sync_resting_orders(symbol, state, sl_price, self._target_tp(symbol, state))
         except Exception as e:
-            log.warning("Resting-order SL sync failed for %s: %s", symbol, e)
+            log.warning("Resting-order SL/TP sync failed for %s: %s", symbol, e)
 
         try:
             position = self.exchange.get_open_position(symbol)
             if not position:
                 return True
             self.exchange.set_position_sl(symbol, sl_price)
-            return True
         except Exception as e:
             log.error("Failed to set SL %s on %s: %s", sl_price, symbol, e)
             self._alert(f"sl_fail:{symbol}",
                         f"⚠️ Could not set SL {sl_price} on {symbol}: {e}\n"
                         f"The position may be UNPROTECTED — check Bitunix. Bot will keep retrying.")
             return False
+        # After the SL so the TP/SL orders set_position_sl created get the TP too.
+        self._sync_position_tp(symbol, state)
+        return True
+
+    def tp_mismatch(self, symbol: str) -> Optional[str]:
+        """Read Bitunix back and describe how its TP differs from state, or None if it matches."""
+        state = self.db.get(symbol)
+        if not state:
+            return None
+        want = self._target_tp(symbol, state)
+        if want is None:
+            return None
+        pos = self.exchange.get_open_position(symbol)
+        if pos:
+            if pos["take_profit"] > 0 and all(self._same_price(p, want) for p in pos["tp_prices"]):
+                return None
+            if not pos["tp_prices"]:
+                return "the position has no TP on Bitunix"
+            return f"position TP on Bitunix is {pos['tp_prices']}" + \
+                   ("" if pos["take_profit"] > 0 else " (not covering the full size)")
+        ours = {state.get("entry_order_id"), state.get("dca_order_id")} - {None, ""}
+        bad = [o for o in self.exchange.get_open_orders(symbol)
+               if o["order_id"] in ours and not self._same_price(o["take_profit"], want)]
+        if bad:
+            return "resting order TP on Bitunix is " + ", ".join(str(o["take_profit"] or "none") for o in bad)
+        return None
 
     def handle_tp_fill(self, symbol: str, filled_order_id: str):
         state = self.db.get(symbol)
@@ -662,25 +717,8 @@ class TradeManager:
                 log.warning("Watchdog: %s has a position but its fill was never processed — handling now", symbol)
                 self.handle_entry_or_dca_fill(symbol)
                 return
-            sl = state.get("sl_price") or 0
-            if pos["stop_loss"] > 0:
-                if sl <= 0:
-                    return
-                want = self.exchange.round_price(symbol, sl)
-                if all(abs(p - want) <= want * 1e-9 for p in pos["sl_prices"]):
-                    return
-                log.warning("Watchdog: %s SL on Bitunix %s != state %s — resyncing", symbol, pos["sl_prices"], want)
-                if self.sync_protective_orders(symbol):
-                    self._alert(f"sl_drift:{symbol}", f"🛡️ {symbol} SL on Bitunix differed from the bot's — reset to {want}.")
-                return
-            if sl > 0:
-                log.warning("Watchdog: %s position has NO stop loss on Bitunix — re-applying %s", symbol, sl)
-                if self.sync_protective_orders(symbol):
-                    self._alert(f"sl_fixed:{symbol}", f"🛡️ {symbol} had no SL on Bitunix — re-applied SL at {sl}.")
-            else:
-                self._alert(f"no_sl:{symbol}",
-                            f"⚠️ {symbol} has NO stop loss and none is on record. "
-                            f"Set one with /sl {symbol} <price>")
+            if not self._check_sl(symbol, state, pos):
+                self._check_tp(symbol, state, pos)
             return
 
         if state.get("position_opened"):
@@ -708,6 +746,41 @@ class TradeManager:
             log.warning("cancel_all failed for %s: %s", symbol, e)
         self.db.delete(symbol)
         self.notify(f"🗑️ {symbol}: entry order is no longer on Bitunix (cancelled or rejected) — trade removed.")
+
+    def _check_sl(self, symbol: str, state: dict, pos: dict) -> bool:
+        """Watchdog SL check. Returns True if it resynced (which also resyncs the TP)."""
+        sl = state.get("sl_price") or 0
+        if pos["stop_loss"] > 0:
+            if sl <= 0:
+                return False
+            want = self.exchange.round_price(symbol, sl)
+            if all(self._same_price(p, want) for p in pos["sl_prices"]):
+                return False
+            log.warning("Watchdog: %s SL on Bitunix %s != state %s — resyncing", symbol, pos["sl_prices"], want)
+            if self.sync_protective_orders(symbol):
+                self._alert(f"sl_drift:{symbol}", f"🛡️ {symbol} SL on Bitunix differed from the bot's — reset to {want}.")
+            return True
+        if sl > 0:
+            log.warning("Watchdog: %s position has NO stop loss on Bitunix — re-applying %s", symbol, sl)
+            if self.sync_protective_orders(symbol):
+                self._alert(f"sl_fixed:{symbol}", f"🛡️ {symbol} had no SL on Bitunix — re-applied SL at {sl}.")
+            return True
+        self._alert(f"no_sl:{symbol}",
+                    f"⚠️ {symbol} has NO stop loss and none is on record. "
+                    f"Set one with /sl {symbol} <price>")
+        return False
+
+    def _check_tp(self, symbol: str, state: dict, pos: dict):
+        """Watchdog TP check: put TP1 from state back if Bitunix lost or changed it."""
+        want = self._target_tp(symbol, state)
+        if want is None:
+            return
+        if pos["take_profit"] > 0 and all(self._same_price(p, want) for p in pos["tp_prices"]):
+            return
+        log.warning("Watchdog: %s TP on Bitunix %s (covers all=%s) != state %s — resyncing",
+                    symbol, pos["tp_prices"], pos["take_profit"] > 0, want)
+        if self._sync_position_tp(symbol, state):
+            self._alert(f"tp_fixed:{symbol}", f"🎯 {symbol} TP on Bitunix was missing or different — set to {want}.")
 
     # ---------- trailing stop ----------
 
@@ -826,11 +899,26 @@ class TradeManager:
             self.pending_mods[symbol] = {"type": "sl", "params": {"new_price": new_sl}, "chat_id": None, "message_id": None}
         return prompt
 
+    def _validate_tps(self, symbol: str, position: str, prices: List[float]):
+        """Bitunix rejects a TP on the wrong side of mark — catch it before the user confirms."""
+        if any(p <= 0 for p in prices):
+            raise ValueError(f"Invalid TP in {prices}.")
+        try:
+            mark = self.exchange.get_mark_price(symbol)
+        except Exception:
+            return
+        for p in prices:
+            if position == "LONG" and p <= mark:
+                raise ValueError(f"For LONG, TP {p} must be above current mark price {mark}.")
+            if position == "SHORT" and p >= mark:
+                raise ValueError(f"For SHORT, TP {p} must be below current mark price {mark}.")
+
     def stage_modify_tp(self, symbol: str, new_prices: List[float]) -> str:
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
             if symbol in self.pending:
                 signal = self.pending[symbol]["signal"]
+                self._validate_tps(symbol, signal.position, new_prices)
                 old = ", ".join(str(t) for t in signal.tps)
                 prompt = f"Modify TPs for {symbol}?\n  Current: {old}\n  New: {', '.join(str(t) for t in new_prices)}"
                 with self._lock:
@@ -838,8 +926,11 @@ class TradeManager:
                 return prompt
             raise ValueError(f"No active position or pending trade for {symbol}.")
 
-        old = ", ".join(str(t) for t in self.db.loads(state["tp_prices"]))
+        self._validate_tps(symbol, state["position"], new_prices)
+        old = ", ".join(str(t) for t in self.db.loads(state["tp_prices"])) or "none"
         prompt = f"Modify TPs for {symbol}?\n  Current: {old}\n  New: {', '.join(str(t) for t in new_prices)}"
+        if len(new_prices) > 1:
+            prompt += f"\n  (Bitunix gets TP1 {new_prices[0]} for the full position)"
         with self._lock:
             self.pending_mods[symbol] = {"type": "tp", "params": {"new_prices": new_prices}, "chat_id": None, "message_id": None}
         return prompt
@@ -884,6 +975,13 @@ class TradeManager:
         params = mod["params"]
         state = self.db.get(symbol)
         if not state:
+            with self._lock:
+                pend = self.pending.get(symbol)
+                if pend and mod_type == "tp":
+                    pend["signal"].tps = list(params["new_prices"])
+            if pend and mod_type == "tp":
+                return (f"✅ TPs for pending {symbol} set to {', '.join(str(t) for t in params['new_prices'])} "
+                        f"— tap Confirm on the trade card to place it.")
             return f"No active position for {symbol}."
 
         if mod_type == "sl":
@@ -896,9 +994,17 @@ class TradeManager:
                     f"the old SL may still be active. Check Bitunix.")
 
         elif mod_type == "tp":
+            prices = ", ".join(str(t) for t in params["new_prices"])
             self.db.upsert(symbol, tp_prices=self.db.dumps(params["new_prices"]))
             self.sync_protective_orders(symbol)
-            return f"✅ TPs updated for {symbol}: {', '.join(str(t) for t in params['new_prices'])}."
+            try:
+                mismatch = self.tp_mismatch(symbol)
+            except Exception as e:
+                mismatch = f"could not read it back ({e})"
+            if mismatch:
+                return (f"⚠️ TPs for {symbol} saved as {prices} but Bitunix did NOT take it — {mismatch}. "
+                        f"Bot will keep retrying; check Bitunix.")
+            return f"✅ TP {params['new_prices'][0]} set on Bitunix for {symbol} (saved: {prices})."
 
         elif mod_type == "dca":
             new_price = params["new_price"]
@@ -916,7 +1022,8 @@ class TradeManager:
                 side = "BUY" if state["position"] == "LONG" else "SELL"
                 dca_price = self.exchange.round_price(symbol, new_price)
                 dca_order = self.exchange.place_limit_order(symbol, side, dca_qty, dca_price,
-                                                         stop_loss=state["sl_price"])
+                                                         stop_loss=state["sl_price"],
+                                                         take_profit=self._target_tp(symbol, state))
                 self.db.upsert(symbol, dca_order_id=dca_order, dca_price=dca_price)
                 return f"✅ DCA placed for {symbol} at {dca_price} (qty ~{dca_qty}) with SL {state['sl_price']}."
             return f"✅ DCA removed for {symbol}."

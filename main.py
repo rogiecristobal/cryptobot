@@ -27,6 +27,8 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler("logs/bot.log")],
 )
 log = logging.getLogger("main")
+# httpx logs every request URL at INFO, and Telegram URLs contain the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 _ssl_path = os.environ.get("SSL_CERT_FILE", "not set")
 log.info("SSL CA bundle: %s (exists=%s)", _ssl_path,

@@ -50,7 +50,11 @@ python3 main.py
 - If a DCA level is present, position size is split between the entry order
   and the DCA order per `DCA_SPLIT_RATIO` (default 0.5 = 50/50), sized so that
   if *both* fill, your total risk still lands near your target `RISK_PERCENT`.
-- Take-profit size is split evenly across however many TPs the signal has.
+- **Only TP1 goes on Bitunix**, for the whole position. It is attached to every
+  opening order (market, limit, DCA) like the SL. `/tp SYMBOL p1 [p2 ...]` moves it
+  (TP1 = p1), and the reply says whether Bitunix actually accepted it. Further TPs
+  are only kept in the bot's state. The watchdog puts TP1 back if it goes missing
+  or is changed on Bitunix, so change it with `/tp` rather than the Bitunix app.
 - First TP fill → SL is cancelled and replaced at entry price (breakeven).
 - SL fill → all remaining orders for that symbol (DCA, unfilled TPs) are cancelled.
 - The SL is attached to every opening order (market, limit entry, DCA), so Bitunix

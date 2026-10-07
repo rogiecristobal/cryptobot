@@ -5,11 +5,13 @@ All Bitunix-specific calls and field names live here. trade_manager.py and
 main.py only ever see these normalized dicts:
 
   position: {symbol, position_id, side ("LONG"/"SHORT"), size, avg_price,
-             unrealized_pnl, leverage, stop_loss, sl_prices}
-            stop_loss is the SL price when the whole position is covered by
-            an SL, else 0. sl_prices lists every resting SL price.
+             unrealized_pnl, leverage, stop_loss, sl_prices,
+             take_profit, tp_prices}
+            stop_loss / take_profit is the price when the whole position is
+            covered by an SL / TP, else 0. sl_prices / tp_prices list every
+            resting SL / TP price.
   order:    {order_id, client_id, symbol, side ("BUY"/"SELL"), order_type,
-             status, qty, price, reduce_only, stop_loss}
+             status, qty, price, reduce_only, stop_loss, take_profit}
   order event (WS):    {symbol, order_id, client_id, event, status, side,
                         order_type, qty, avg_price, reduce_only}
   position event (WS): {symbol, position_id, event, side, size}
@@ -347,11 +349,26 @@ class BitunixClient:
         return [o for o in tpsl_orders if _f(o.get("slPrice")) > 0]
 
     @staticmethod
+    def _tp_orders(tpsl_orders: list) -> list:
+        return [o for o in tpsl_orders if _f(o.get("tpPrice")) > 0]
+
+    @staticmethod
+    def _is_position_level(o: dict) -> bool:
+        """Position TP/SL orders carry no qty and close the whole position."""
+        return not _f(o.get("slQty")) and not _f(o.get("tpQty"))
+
+    @staticmethod
     def _sl_covers(sl_orders: list, size: float) -> bool:
         """A position-level SL (no slQty) covers everything; partial ones must add up to the size."""
         if any(not _f(o.get("slQty")) for o in sl_orders):
             return True
         return sum(_f(o.get("slQty")) for o in sl_orders) >= size * (1 - 1e-9)
+
+    @classmethod
+    def _tp_covers(cls, tp_orders: list, size: float) -> bool:
+        if any(cls._is_position_level(o) for o in tp_orders):
+            return True
+        return sum(_f(o.get("tpQty")) or _f(o.get("slQty")) for o in tp_orders) >= size * (1 - 1e-9)
 
     def _normalize_position(self, p: dict) -> dict:
         size = _f(p.get("qty"))
@@ -359,8 +376,11 @@ class BitunixClient:
         side = {"BUY": "LONG", "SELL": "SHORT"}.get(side, side)
         avg = _f(p.get("avgOpenPrice")) or (_f(p.get("entryValue")) / size if size else 0.0)
         position_id = str(p.get("positionId") or "")
-        sl_orders = self._sl_orders(self.get_tpsl_orders(p["symbol"], position_id))
+        tpsl_orders = self.get_tpsl_orders(p["symbol"], position_id)
+        sl_orders = self._sl_orders(tpsl_orders)
         sl_prices = sorted({_f(o["slPrice"]) for o in sl_orders})
+        tp_orders = self._tp_orders(tpsl_orders)
+        tp_prices = sorted({_f(o["tpPrice"]) for o in tp_orders})
         return {
             "symbol": p.get("symbol"),
             "position_id": position_id,
@@ -371,6 +391,8 @@ class BitunixClient:
             "leverage": int(_f(p.get("leverage")) or 1),
             "stop_loss": sl_prices[0] if sl_orders and self._sl_covers(sl_orders, size) else 0.0,
             "sl_prices": sl_prices,
+            "take_profit": tp_prices[0] if tp_orders and self._tp_covers(tp_orders, size) else 0.0,
+            "tp_prices": tp_prices,
         }
 
     def get_all_open_positions(self) -> list:
@@ -403,6 +425,7 @@ class BitunixClient:
             "price": _f(o.get("price")),
             "reduce_only": bool(o.get("reduceOnly") or o.get("reductionOnly")),
             "stop_loss": _f(o.get("slPrice")),
+            "take_profit": _f(o.get("tpPrice")),
         }
 
     def get_open_orders(self, symbol: str) -> list:
@@ -487,17 +510,49 @@ class BitunixClient:
         self._add_tpsl(body, symbol, stop_loss, take_profit)
         return self._place_order_once(body)
 
-    def amend_order_sl(self, symbol: str, order: dict, sl_price: float):
-        """Change the SL attached to a resting (unfilled) order. Bitunix requires qty+price on every modify."""
+    def amend_order_tpsl(self, symbol: str, order: dict, sl_price: float, tp_price: float | None):
+        """
+        Change the SL/TP attached to a resting (unfilled) order. Bitunix requires
+        qty+price on every modify, and both legs are sent so changing one never
+        drops the other. tp_price None keeps the order's current TP.
+        """
         symbol = self._norm(symbol)
-        self._post("/api/v1/futures/trade/modify_order", {
-            "orderId": order["order_id"],
-            "qty": self._fmt_qty(symbol, order["qty"]),
-            "price": self._fmt_price(symbol, order["price"]),
-            "slPrice": self._fmt_price(symbol, sl_price),
-            "slStopType": STOP_TYPE,
-            "slOrderType": "MARKET",
-        })
+        body = {"orderId": order["order_id"],
+                "qty": self._fmt_qty(symbol, order["qty"]),
+                "price": self._fmt_price(symbol, order["price"])}
+        if tp_price is None and order.get("take_profit", 0) > 0:
+            tp_price = order["take_profit"]
+        self._add_tpsl(body, symbol, sl_price, tp_price)
+        self._post("/api/v1/futures/trade/modify_order", body)
+
+    def _modify_tpsl_order(self, symbol: str, position_id: str, o: dict,
+                           sl_str: str | None = None, tp_str: str | None = None):
+        """
+        Rewrite one TP/SL order. A leg passed as None keeps its current price;
+        both legs are always sent so changing one never drops the other.
+        """
+        sl = sl_str or (o["slPrice"] if _f(o.get("slPrice")) > 0 else None)
+        tp = tp_str or (o["tpPrice"] if _f(o.get("tpPrice")) > 0 else None)
+        if self._is_position_level(o):
+            body = {"symbol": symbol, "positionId": position_id}
+            if sl:
+                body.update(slPrice=sl, slStopType=STOP_TYPE)
+            if tp:
+                body.update(tpPrice=tp, tpStopType=o.get("tpStopType") or STOP_TYPE)
+            self._post("/api/v1/futures/tpsl/position/modify_order", body)
+            return
+        qty = o.get("slQty") or o.get("tpQty")
+        body = {"orderId": str(o.get("id") or o.get("orderId"))}
+        if sl:
+            body.update(slPrice=sl, slStopType=STOP_TYPE, slOrderType="MARKET", slQty=o.get("slQty") or qty)
+        if tp:
+            body.update(tpPrice=tp, tpStopType=o.get("tpStopType") or STOP_TYPE, tpQty=o.get("tpQty") or qty)
+            if tp_str is None and o.get("tpOrderPrice"):
+                # Unchanged TP: keep a limit TP exactly as it was.
+                body.update(tpOrderType=o.get("tpOrderType") or "LIMIT", tpOrderPrice=o["tpOrderPrice"])
+            else:
+                body["tpOrderType"] = "MARKET"
+        self._post("/api/v1/futures/tpsl/modify_order", body)
 
     @_retry()
     def set_position_sl(self, symbol: str, sl_price: float):
@@ -523,21 +578,7 @@ class BitunixClient:
         for o in sl_orders:
             if abs(_f(o["slPrice"]) - target) <= tol:
                 continue
-            if not _f(o.get("slQty")):
-                body = {"symbol": symbol, "positionId": position_id,
-                        "slPrice": sl_str, "slStopType": STOP_TYPE}
-                if _f(o.get("tpPrice")) > 0:
-                    body.update(tpPrice=o["tpPrice"], tpStopType=o.get("tpStopType") or STOP_TYPE)
-                self._post("/api/v1/futures/tpsl/position/modify_order", body)
-            else:
-                body = {"orderId": str(o.get("id") or o.get("orderId")), "slPrice": sl_str,
-                        "slStopType": STOP_TYPE, "slOrderType": "MARKET", "slQty": o["slQty"]}
-                if _f(o.get("tpPrice")) > 0:
-                    body.update(tpPrice=o["tpPrice"], tpStopType=o.get("tpStopType") or STOP_TYPE,
-                                tpOrderType=o.get("tpOrderType") or "MARKET", tpQty=o.get("tpQty"))
-                    if o.get("tpOrderPrice"):
-                        body["tpOrderPrice"] = o["tpOrderPrice"]
-                self._post("/api/v1/futures/tpsl/modify_order", body)
+            self._modify_tpsl_order(symbol, position_id, o, sl_str=sl_str)
             log.info("%s: moved SL order %s %s -> %s", symbol, o.get("id"), o.get("slPrice"), sl_str)
 
         if not self._sl_covers(sl_orders, size):
@@ -545,6 +586,39 @@ class BitunixClient:
                        {"symbol": symbol, "positionId": position_id,
                         "slPrice": sl_str, "slStopType": STOP_TYPE})
             log.info("%s: placed position SL at %s (size %s)", symbol, sl_str, size)
+
+    @_retry()
+    def set_position_tp(self, symbol: str, tp_price: float):
+        """
+        Make every TP/SL order on the open position take profit at tp_price and
+        make sure the whole position is covered. Call after set_position_sl so
+        the SL orders it creates also get the TP. Raises on failure.
+        """
+        symbol = self._norm(symbol)
+        if tp_price is None or tp_price <= 0:
+            raise ValueError(f"Refusing to set invalid TP {tp_price} on {symbol}")
+        raw = next((p for p in self._raw_positions(symbol) if p.get("symbol") == symbol), None)
+        if not raw:
+            raise RuntimeError(f"No open {symbol} position to attach a TP to")
+        position_id = str(raw["positionId"])
+        size = _f(raw.get("qty"))
+        tp_str = self._fmt_price(symbol, tp_price)
+        target = float(tp_str)
+        tol = target * 1e-9
+
+        orders = self.get_tpsl_orders(symbol, position_id)
+        for o in orders:
+            if abs(_f(o.get("tpPrice")) - target) <= tol:
+                continue
+            self._modify_tpsl_order(symbol, position_id, o, tp_str=tp_str)
+            log.info("%s: moved TP order %s %s -> %s", symbol, o.get("id"), o.get("tpPrice") or "none", tp_str)
+
+        # Every order now carries the TP; top up if together they don't span the position.
+        if not orders or not self._tp_covers(orders, size):
+            self._post("/api/v1/futures/tpsl/position/place_order",
+                       {"symbol": symbol, "positionId": position_id,
+                        "tpPrice": tp_str, "tpStopType": STOP_TYPE})
+            log.info("%s: placed position TP at %s (size %s)", symbol, tp_str, size)
 
     def cancel_order(self, symbol: str, order_id: str):
         symbol = self._norm(symbol)
