@@ -38,6 +38,39 @@ Run:
 python3 main.py
 ```
 
+## Updating on Termux
+
+`git pull` updates the code, but **not `.env`**: it is gitignored, so any
+setting change has to be made by hand on the phone.
+
+```bash
+# 1. Stop the running bot (Ctrl+C). Two copies polling Telegram at once fail
+#    with "Conflict: terminated by other getUpdates request".
+cd ~/cryptobot            # wherever you cloned it
+git pull
+pip install -r requirements.txt --break-system-packages   # only if requirements.txt changed
+# 2. Apply any .env changes listed below
+# 3. Start it again
+python3 main.py
+```
+
+Open trades survive the restart: on startup `reconcile()` re-checks every
+trade against Bitunix and re-applies its SL and TP.
+
+### `.env` changes by version
+
+- **Margin mode defaults to cross.** If your `.env` still has
+  `DEFAULT_MARGIN_MODE=ISOLATED`, set it to `CROSS` (or delete the line):
+  ```bash
+  sed -i 's/^DEFAULT_MARGIN_MODE=.*/DEFAULT_MARGIN_MODE=CROSS/' .env
+  ```
+  This only affects new trades. Bitunix can't change the margin mode of a
+  coin that has an open position or order, so those stay isolated until closed.
+- **Telegram bot token no longer logged.** Older versions wrote the bot token
+  into `logs/bot.log` on every request. Clear the old log with
+  `: > logs/bot.log`, and if that file was ever shared or backed up, revoke
+  the token in @BotFather and put the new one in `TELEGRAM_BOT_TOKEN`.
+
 ## How it behaves
 
 - **Only your `TELEGRAM_CHAT_ID`** can trigger anything — every other chat is ignored.

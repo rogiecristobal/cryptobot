@@ -31,7 +31,7 @@ DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "10"))
 if not 1 <= DEFAULT_LEVERAGE <= 100:
     raise RuntimeError(f"DEFAULT_LEVERAGE must be 1-100, got {DEFAULT_LEVERAGE}")
 
-DEFAULT_MARGIN_MODE = os.getenv("DEFAULT_MARGIN_MODE", "ISOLATED").upper()
+DEFAULT_MARGIN_MODE = os.getenv("DEFAULT_MARGIN_MODE", "CROSS").upper()
 if DEFAULT_MARGIN_MODE not in ("ISOLATED", "CROSS"):
     raise RuntimeError(f"DEFAULT_MARGIN_MODE must be ISOLATED or CROSS, got {DEFAULT_MARGIN_MODE}")
 
