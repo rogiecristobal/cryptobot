@@ -1,7 +1,7 @@
 # Bitunix Signal Trading Bot
 
 Pastes a signal into Telegram → you reply ✅ → bot places entry/DCA on Bitunix (USDT-M futures) →
-auto-manages SL/TP, moves SL to breakeven after TP1, and cancels everything for
+auto-manages SL and split TPs, steps the SL up as each TP hits, and cancels everything for
 that asset if SL hits.
 
 ## ⚠️ Before you touch mainnet keys
@@ -83,12 +83,22 @@ trade against Bitunix and re-applies its SL and TP.
 - If a DCA level is present, position size is split between the entry order
   and the DCA order per `DCA_SPLIT_RATIO` (default 0.5 = 50/50), sized so that
   if *both* fill, your total risk still lands near your target `RISK_PERCENT`.
-- **Only TP1 goes on Bitunix**, for the whole position. It is attached to every
-  opening order (market, limit, DCA) like the SL. `/tp SYMBOL p1 [p2 ...]` moves it
-  (TP1 = p1), and the reply says whether Bitunix actually accepted it. Further TPs
-  are only kept in the bot's state. The watchdog puts TP1 back if it goes missing
-  or is changed on Bitunix, so change it with `/tp` rather than the Bitunix app.
-- First TP fill → SL is cancelled and replaced at entry price (breakeven).
+- **Multiple TPs split the position.** With TPs `71000 72000 73000` (in `/place …
+  TP 71000 72000 73000` or `/tp BTC 71000 72000 73000`), TP1 and TP2 are partial
+  TP orders on Bitunix that each close ~1/3, and TP3 closes whatever is left.
+  TPs are sorted nearest-first, so their order in the command doesn't matter.
+  The last TP is attached to every opening order (market, limit, DCA) like the
+  SL; the partial TPs are placed as soon as there is a position, and resized
+  when a DCA fills. A position too small to split (each part must be at least
+  Bitunix's minimum qty) uses fewer TPs, and `/tp` says so.
+- **SL steps up as TPs hit**: to entry after the first TP, then to the previous
+  TP after each later one (TP2 hit → SL at TP1). It never loosens an SL, so if
+  the trailing stop is already past that level it stays. You get a Telegram
+  message for each hit. Hits are read from Bitunix's TP/SL push; if that was
+  missed, the watchdog checks TP/SL order history, then mark price.
+- `/tp` replaces the TPs still to hit (hit ones are kept), and the reply says
+  whether Bitunix accepted all of it. The watchdog puts back a TP that goes
+  missing or is changed on Bitunix, so change TPs with `/tp`, not the Bitunix app.
 - SL fill → all remaining orders for that symbol (DCA, unfilled TPs) are cancelled.
 - The SL is attached to every opening order (market, limit entry, DCA), so Bitunix
   creates its TP/SL order on the fill itself even if the bot is offline at that moment.
@@ -114,8 +124,11 @@ trade against Bitunix and re-applies its SL and TP.
 - **Position mode**: fills are classified by order side (same side as the
   trade = entry/DCA, opposite = close). Verified in hedge mode too, but holding
   a long and a short on the same symbol would confuse it.
-- **TP vs SL labels**: Bitunix fill events don't say which trigger fired, so a
-  closing market fill is labelled TP or SL by which price it landed closest to.
+- **TP vs SL labels**: Bitunix fill events don't say which trigger fired. A
+  partial TP is matched by its TP/SL order id; a full close is labelled from the
+  TP/SL push, or by which price it landed closest to.
+- **Partial closes you make in the Bitunix app** look like an SL chunk firing:
+  the bot closes the rest of the position. Use `/close` instead.
 - **Attached TP/SL**: on fill, Bitunix turns the SL (and TP) attached to an
   entry into separate TP/SL orders sized to that fill. Moving the SL updates
   all of them; the watchdog tops up coverage if any part of the position has

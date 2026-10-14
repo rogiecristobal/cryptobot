@@ -97,13 +97,14 @@ def build_app(manager_ref):
         if len(args) < 4:
             await update.message.reply_text(
                 "Usage:\n"
-                "  /place <ASSET> LONG|SHORT <ENTRY|market> SL <SL> [TP <TP>] [DCA <DCA>] [RISK <%>] [LEVERAGEx] [TRAIL [mult]]\n"
+                "  /place <ASSET> LONG|SHORT <ENTRY|market> SL <SL> [TP <TP1> [TP2 ...]] [DCA <DCA>] [RISK <%>] [LEVERAGEx] [TRAIL [mult]]\n"
                 "Examples:\n"
                 "  /place BTC LONG 69000 SL 67000 TP 71000 5x\n"
                 "  /place BTC LONG 69000 SL 67000 5x\n"
                 "  /place ETH LONG 3500 SL 3400 TP 3600 DCA 3450 RISK 5 3x\n"
                 "  /place SOL LONG market SL 140\n"
-                "  /place BTC LONG market SL 67000 TP 71000 TRAIL 2"
+                "  /place BTC LONG market SL 67000 TP 71000 TRAIL 2\n"
+                "  /place BTC LONG 69000 SL 67000 TP 71000 72000 73000"
             )
             return
 
@@ -124,7 +125,7 @@ def build_app(manager_ref):
             return
 
         sl = None
-        tp = None
+        tps: List[float] = []
         dca = None
         risk_pct = None
         leverage = config.DEFAULT_LEVERAGE
@@ -160,7 +161,11 @@ def build_app(manager_ref):
                 if label == "sl":
                     sl = val
                 elif label == "tp":
-                    tp = val
+                    # TP takes one or more prices: TP 71000 72000 73000
+                    tps.append(val)
+                    while i + 1 < len(rest) and _parse_float(rest[i + 1]) is not None:
+                        i += 1
+                        tps.append(_parse_float(rest[i]))
                 elif label == "dca":
                     dca = val
                 elif label == "risk":
@@ -189,7 +194,7 @@ def build_app(manager_ref):
             if direction == "SHORT" and sl <= entry:
                 await update.message.reply_text("For SHORT, SL must be above entry.")
                 return
-            if tp is not None:
+            for tp in tps:
                 if direction == "LONG" and tp <= entry:
                     await update.message.reply_text(f"For LONG, TP {tp} must be above entry {entry}.")
                     return
@@ -203,8 +208,6 @@ def build_app(manager_ref):
                 if direction == "SHORT" and dca <= entry:
                     await update.message.reply_text(f"For SHORT, DCA {dca} must be below entry {entry}.")
                     return
-
-        tps = [tp] if tp is not None else []
 
         signal = ParsedSignal(
             asset=asset,
@@ -246,7 +249,11 @@ def build_app(manager_ref):
             return
         args = context.args
         if len(args) < 2:
-            await update.message.reply_text("Usage: /tp <SYMBOL> <price1> [price2 ...]")
+            await update.message.reply_text(
+                "Usage: /tp <SYMBOL> <tp1> [tp2 tp3 ...]\n"
+                "Each TP but the last closes an equal share of the position; the last closes the rest.\n"
+                "SL moves to entry when the first TP hits, then to the previous TP after each later one."
+            )
             return
         symbol = args[0].upper()
         if not symbol.endswith("USDT"):
@@ -347,10 +354,10 @@ def build_app(manager_ref):
         await update.message.reply_text(
             "🤖 CryptoBot Commands\n\n"
             "/place <ASSET> LONG|SHORT <ENTRY|market> SL <SL> [options]\n"
-            "  Options: TP <price> DCA <price> RISK <%> LEVERAGEx\n"
+            "  Options: TP <p1> [p2 p3] DCA <price> RISK <%> LEVERAGEx\n"
             "  Example: /place BTC LONG market SL 67000 TP 71000 RISK 3 5x\n\n"
             "/sl <SYMBOL> <price>     \u2014 Modify stop loss\n"
-            "/tp <SYMBOL> <p1> [p2]   \u2014 Modify take profit prices\n"
+            "/tp <SYMBOL> <p1> [p2 p3] \u2014 Set TPs (split evenly, SL steps up on each hit)\n"
             "/dca <SYMBOL> [price]    \u2014 Add/remove DCA order\n"
             "/entry <SYMBOL> <price>  \u2014 Modify entry (pending only)\n"
             "/trail <SYMBOL> [mult]   \u2014 Set trailing stop (default 1R)\n"

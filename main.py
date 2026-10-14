@@ -120,10 +120,10 @@ async def _handle_fill_async(item: dict, state: dict | None, trade_manager: Trad
         return
     elif state["status"] == "active":
         if item["order_type"] == "MARKET":
-            # TP/SL triggers execute as market orders on Bitunix.
-            source = await asyncio.to_thread(trade_manager.classify_exit, symbol, item["avg_price"])
-            log.info("%s fill detected: %s %s at %s", source, symbol, order_id, item["avg_price"])
-            await asyncio.to_thread(trade_manager.handle_sl_fill, symbol, source)
+            # TP/SL triggers execute as market orders on Bitunix. A partial TP
+            # leaves the position open; anything else closes out the trade.
+            log.info("Closing fill: %s %s at %s", symbol, order_id, item["avg_price"])
+            await asyncio.to_thread(trade_manager.handle_exit_fill, symbol, item["avg_price"])
         else:
             log.info("Manual TP fill detected: %s %s", symbol, order_id)
             await _handle_manual_tp(symbol, trade_manager, tg_app, db)

@@ -64,6 +64,9 @@ class StateDB:
             ("ALTER TABLE trades ADD COLUMN entry_qty REAL", "entry_qty"),
             # Best mark price since the bot-side trailing stop engaged (Bitunix has no native one).
             ("ALTER TABLE trades ADD COLUMN trailing_peak REAL", "trailing_peak"),
+            # Bitunix ids of the partial TP orders (TP1..TP(n-1)), aligned with tp_prices.
+            # Not tp_order_ids: old Bybit-era rows may still hold Bybit ids there.
+            ("ALTER TABLE trades ADD COLUMN tp_ladder_ids TEXT", "tp_ladder_ids"),
         ]
         for sql, col in migrations:
             try:
