@@ -1,7 +1,7 @@
 # Bitunix Signal Trading Bot
 
 Pastes a signal into Telegram → you reply ✅ → bot places entry/DCA on Bitunix (USDT-M futures) →
-auto-manages SL and split TPs, steps the SL up as each TP hits, and cancels everything for
+auto-manages SL/TP, steps the SL up as price reaches each TP, and cancels everything for
 that asset if SL hits.
 
 ## ⚠️ Before you touch mainnet keys
@@ -41,33 +41,46 @@ python3 main.py
 ## Updating on Termux
 
 `git pull` updates the code, but **not `.env`**: it is gitignored, so any
-setting change has to be made by hand on the phone.
+setting change has to be made by hand on the phone. Check the update notes
+below for anything that needs doing.
 
 ```bash
-# 1. Stop the running bot (Ctrl+C). Two copies polling Telegram at once fail
+# 1. Note your open trades first: send /status to the bot in Telegram.
+# 2. Stop the running bot (Ctrl+C). Two copies polling Telegram at once fail
 #    with "Conflict: terminated by other getUpdates request".
 cd ~/cryptobot            # wherever you cloned it
 git pull
 pip install -r requirements.txt --break-system-packages   # only if requirements.txt changed
-# 2. Apply any .env changes listed below
-# 3. Start it again
+# 3. Apply any .env changes from the update notes below
+# 4. Start it again
 python3 main.py
+# 5. Check the "reconciled" messages in Telegram, or send /status
 ```
 
 Open trades survive the restart: on startup `reconcile()` re-checks every
-trade against Bitunix and re-applies its SL and TP.
+trade against Bitunix and re-applies its SL and TPs. Database changes are
+applied automatically on startup — there is nothing to migrate by hand.
 
-### `.env` changes by version
+### Update notes (newest first)
 
-- **Margin mode defaults to cross.** If your `.env` still has
+- **TPs move the SL instead of taking profit** (this update). No `.env` change.
+  - Only the **last** TP closes the position; earlier TPs only move the SL.
+  - Open trades from `2b8f590` (which split the position across TPs) have
+    their partial TP orders **cancelled on the first restart**, so nothing
+    closes before the last TP. Their SL and last TP stay on Bitunix.
+  - Check after the restart: in the Bitunix app each open position should
+    show one TP/SL with the last TP — no partial TPs.
+- **Split TPs and SL step-up** (`2b8f590`). Replaced by the update above —
+  skip straight to it.
+- **Margin mode defaults to cross** (`55edff4`). If your `.env` still has
   `DEFAULT_MARGIN_MODE=ISOLATED`, set it to `CROSS` (or delete the line):
   ```bash
   sed -i 's/^DEFAULT_MARGIN_MODE=.*/DEFAULT_MARGIN_MODE=CROSS/' .env
   ```
   This only affects new trades. Bitunix can't change the margin mode of a
   coin that has an open position or order, so those stay isolated until closed.
-- **Telegram bot token no longer logged.** Older versions wrote the bot token
-  into `logs/bot.log` on every request. Clear the old log with
+- **Telegram bot token no longer logged** (`56ae98f`). Older versions wrote
+  the bot token into `logs/bot.log` on every request. Clear the old log with
   `: > logs/bot.log`, and if that file was ever shared or backed up, revoke
   the token in @BotFather and put the new one in `TELEGRAM_BOT_TOKEN`.
 
@@ -83,21 +96,19 @@ trade against Bitunix and re-applies its SL and TP.
 - If a DCA level is present, position size is split between the entry order
   and the DCA order per `DCA_SPLIT_RATIO` (default 0.5 = 50/50), sized so that
   if *both* fill, your total risk still lands near your target `RISK_PERCENT`.
-- **Multiple TPs split the position.** With TPs `71000 72000 73000` (in `/place …
-  TP 71000 72000 73000` or `/tp BTC 71000 72000 73000`), TP1 and TP2 are partial
-  TP orders on Bitunix that each close ~1/3, and TP3 closes whatever is left.
+- **Only the last TP takes profit.** With TPs `71000 72000 73000` (in `/place …
+  TP 71000 72000 73000` or `/tp BTC 71000 72000 73000`), TP3 is a real TP on
+  Bitunix that closes the whole position. It is attached to every opening
+  order (market, limit, DCA) like the SL, so it works even if the bot is offline.
   TPs are sorted nearest-first, so their order in the command doesn't matter.
-  The last TP is attached to every opening order (market, limit, DCA) like the
-  SL; the partial TPs are placed as soon as there is a position, and resized
-  when a DCA fills. A position too small to split (each part must be at least
-  Bitunix's minimum qty) uses fewer TPs, and `/tp` says so.
-- **SL steps up as TPs hit**: to entry after the first TP, then to the previous
-  TP after each later one (TP2 hit → SL at TP1). It never loosens an SL, so if
-  the trailing stop is already past that level it stays. You get a Telegram
-  message for each hit. Hits are read from Bitunix's TP/SL push; if that was
-  missed, the watchdog checks TP/SL order history, then mark price.
-- `/tp` replaces the TPs still to hit (hit ones are kept), and the reply says
-  whether Bitunix accepted all of it. The watchdog puts back a TP that goes
+- **Earlier TPs are SL checkpoints**: nothing is closed there. When mark price
+  reaches TP1 the SL moves to entry; at TP2 it moves to TP1, and so on. It
+  never loosens an SL, so if the trailing stop is already past that level it
+  stays. You get a Telegram message for each checkpoint. Like the trailing
+  stop, this is bot-side (checked every `TRAILING_INTERVAL_SECONDS`) and only
+  works while the bot runs; on restart it catches up with the current price.
+- `/tp` replaces the TPs still ahead (reached ones are kept), and the reply says
+  whether Bitunix accepted it. The watchdog puts back a last TP that goes
   missing or is changed on Bitunix, so change TPs with `/tp`, not the Bitunix app.
 - SL fill → all remaining orders for that symbol (DCA, unfilled TPs) are cancelled.
 - The SL is attached to every opening order (market, limit entry, DCA), so Bitunix
@@ -124,9 +135,8 @@ trade against Bitunix and re-applies its SL and TP.
 - **Position mode**: fills are classified by order side (same side as the
   trade = entry/DCA, opposite = close). Verified in hedge mode too, but holding
   a long and a short on the same symbol would confuse it.
-- **TP vs SL labels**: Bitunix fill events don't say which trigger fired. A
-  partial TP is matched by its TP/SL order id; a full close is labelled from the
-  TP/SL push, or by which price it landed closest to.
+- **TP vs SL labels**: Bitunix fill events don't say which trigger fired, so a
+  close is labelled from the TP/SL push, or by which price it landed closest to.
 - **Partial closes you make in the Bitunix app** look like an SL chunk firing:
   the bot closes the rest of the position. Use `/close` instead.
 - **Attached TP/SL**: on fill, Bitunix turns the SL (and TP) attached to an

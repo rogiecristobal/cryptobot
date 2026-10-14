@@ -304,7 +304,7 @@ class TradeManager:
         # The SL and TP1 are attached to every opening order (market, limit entry, DCA),
         # so Bitunix creates its TP/SL order on the fill itself — protection no longer depends on
         # the bot being online and catching the fill event.
-        # Entries carry the final TP; TP1..TP(n-1) are placed as partial TPs once there's a position.
+        # Entries carry the last TP, which closes the position; earlier TPs are SL checkpoints.
         tp = signal.tps[-1] if signal.tps else None
         try:
             if signal.entry_is_market:
@@ -334,7 +334,7 @@ class TradeManager:
         entry_desc = "Market" if signal.entry_is_market else "Limit"
         tp_desc = f" & TP {tp}" if tp is not None else ""
         if len(signal.tps) > 1:
-            tp_desc = f" & final TP {tp} (the other TPs are placed once it fills)"
+            tp_desc = f" & final TP {tp} (earlier TPs move the SL)"
         return f"{entry_desc} entry placed for {symbol} with native SL{tp_desc}.{dca_warning}"
 
     def _cleanup_failed_entry(self, symbol: str):
@@ -369,15 +369,15 @@ class TradeManager:
 
     # ---------- take profits ----------
     #
-    # tp_prices holds the TP levels still to hit, nearest first; filled_tp_prices
-    # the ones already hit. With N levels left, TP1..TP(N-1) are partial TP-only
-    # orders on Bitunix (ids in tp_ladder_ids), each closing ~1/N of the position,
-    # and the last level is a TP on every other TP/SL order — it closes whatever
-    # is left. When a ladder order fires, the SL steps up: to entry after the
-    # first TP, then to the previous TP after each later one.
+    # tp_prices holds the TP levels still ahead, nearest first; filled_tp_prices
+    # the ones already reached. Only the LAST level is a real TP on Bitunix: it
+    # sits on every TP/SL order (and on entry/DCA orders) and closes the whole
+    # position. The earlier levels are checkpoints the bot watches on mark
+    # price — nothing is closed there, the SL steps up instead: to entry at the
+    # first one, then to the previous checkpoint at each later one.
 
     def _target_tp(self, symbol: str, state: dict) -> Optional[float]:
-        """Final TP level from state, rounded for Bitunix. This is the TP attached to entry/DCA orders."""
+        """The last TP level, rounded for Bitunix — the only TP placed on the exchange."""
         tps = self.db.loads(state.get("tp_prices"))
         return self.exchange.round_price(symbol, tps[-1]) if tps else None
 
@@ -391,7 +391,7 @@ class TradeManager:
         return sorted(set(prices), reverse=(position == "SHORT"))
 
     def _tp_label(self, state: dict, index: int) -> str:
-        """'TP3' for index 0 of the remaining levels when two TPs were already hit."""
+        """'TP3' for index 0 of the remaining levels when two TPs were already reached."""
         return f"TP{len(self.db.loads(state.get('filled_tp_prices'))) + index + 1}"
 
     def _sync_resting_orders(self, symbol: str, state: dict, sl_price: float,
@@ -419,161 +419,135 @@ class TradeManager:
                 problems.append(f"resting order {order['order_id']}: {e}")
         return problems
 
-    def _tp_plan(self, symbol: str, levels: List[float], size: float) -> tuple[int, float]:
-        """How many levels fit on a position of this size, and the qty of each partial TP."""
-        n = len(levels)
-        min_qty = self.exchange.min_qty(symbol)
-        while n > 1 and self.exchange.floor_qty(symbol, size / n) < max(min_qty, 1e-12):
-            n -= 1
-        return n, self.exchange.floor_qty(symbol, size / n)
-
     def _sync_tps(self, symbol: str, pos: dict) -> tuple[List[str], List[str]]:
         """
-        Make the TP ladder on the open position match state. Idempotent: only
-        sends requests for what differs. Returns (changes, problems) as
-        human-readable strings. Call _detect_tp_hits first, or a ladder order
-        that just fired would be placed again.
+        Put the last TP level on the open position. Idempotent: only sends
+        requests for what differs. Returns (changes, problems) as
+        human-readable strings.
         """
         changes, problems = [], []
         with self._tp_lock:
             state = self.db.get(symbol)
             if not state or state["status"] != "active":
                 return changes, problems
-            levels = [self.exchange.round_price(symbol, p) for p in self.db.loads(state.get("tp_prices"))]
-            ids = self.db.loads(state.get("tp_ladder_ids"))
-            if not levels and not ids:
-                return changes, problems
-            position_id = pos["position_id"]
-            size = pos["size"]
-            n_place, qty = self._tp_plan(symbol, levels, size) if levels else (0, 0.0)
-            if 0 < n_place < len(levels):
-                log.info("%s: size %s too small to split across %d TPs — using %d", symbol, size, len(levels), n_place)
-            ladder = levels[:max(n_place - 1, 0)]
-            pending = {str(o.get("id")): o for o in self.exchange.get_tpsl_orders(symbol, position_id)}
-
-            new_ids = []
-            for i, price in enumerate(ladder):
-                label = self._tp_label(state, i)
-                oid = ids[i] if i < len(ids) else None
-                o = pending.get(str(oid)) if oid else None
-                try:
-                    if o is None:
-                        oid = self.exchange.place_partial_tp(symbol, position_id, price, qty)
-                        changes.append(f"placed {label} {price} x{qty:g}")
-                    elif not (self._same_price(float(o.get("tpPrice") or 0), price)
-                              and self._same_price(float(o.get("tpQty") or 0), qty)):
-                        self.exchange.modify_partial_tp(symbol, oid, price, qty)
-                        changes.append(f"moved {label} to {price} x{qty:g}")
-                except Exception as e:
-                    log.error("%s: %s %s failed: %s", symbol, label, price, e)
-                    problems.append(f"{label} {price}: {e}")
-                    oid = oid if o is not None else None
-                new_ids.append(oid)
-            for oid in ids[len(ladder):]:
-                if oid and str(oid) in pending:
+            # Partial TP orders from the version that split the position: cancel
+            # them so nothing closes before the last TP.
+            stale = [i for i in self.db.loads(state.get("tp_ladder_ids")) if i]
+            if stale:
+                pending = {str(o.get("id")) for o in self.exchange.get_tpsl_orders(symbol, pos["position_id"])}
+                for oid in stale:
+                    if str(oid) not in pending:
+                        continue
                     try:
                         self.exchange.cancel_tpsl(symbol, oid)
-                        changes.append(f"cancelled spare TP order {oid}")
+                        changes.append(f"cancelled partial TP order {oid}")
                     except Exception as e:
-                        problems.append(f"cancel spare TP order {oid}: {e}")
-            if new_ids != ids:
-                self.db.upsert(symbol, tp_ladder_ids=self.db.dumps(new_ids))
-
-            if n_place:
-                final = levels[n_place - 1]
-                label = self._tp_label(state, n_place - 1)
+                        problems.append(f"cancel partial TP order {oid}: {e}")
+                if not problems:
+                    self.db.upsert(symbol, tp_ladder_ids=None)
+            final = self._target_tp(symbol, state)
+            if final is not None:
+                levels = self.db.loads(state.get("tp_prices"))
+                label = self._tp_label(state, len(levels) - 1)
                 try:
-                    if self.exchange.set_position_tp(symbol, final, exclude_ids=new_ids):
-                        changes.append(f"set {label} {final} for the rest of the position")
+                    if self.exchange.set_position_tp(symbol, final, exclude_ids=stale):
+                        changes.append(f"set {label} {final} to close the position")
                 except Exception as e:
-                    log.error("Failed to set final TP %s on %s: %s", final, symbol, e)
+                    log.error("Failed to set TP %s on %s: %s", final, symbol, e)
                     problems.append(f"{label} {final}: {e}")
         if changes:
             log.info("%s TP sync: %s", symbol, "; ".join(changes))
         return changes, problems
 
-    def _detect_tp_hits(self, symbol: str) -> int:
+    @staticmethod
+    def _reached(position: str, mark: float, level: float) -> bool:
+        return mark >= level if position == "LONG" else mark <= level
+
+    def check_tp_checkpoints(self):
         """
-        Find ladder TP orders that fired since the last check, record them and
-        step the SL up. A ladder order that is no longer pending is a hit when
-        Bitunix says it FILLED — or, if its status can't be found, when mark
-        price has reached its level. Returns the number of new hits.
+        Bot-side, like the trailing stop: every TRAILING_INTERVAL_SECONDS read
+        mark prices and step the SL up for any checkpoint price has reached.
+        Only works while the bot is running.
+        """
+        states = [s for s in (self.db.get(sym) for sym in self.db.all_active())
+                  if s and s.get("position_opened") and len(self.db.loads(s.get("tp_prices"))) > 1]
+        if not states:
+            return
+        marks = self.exchange.get_mark_prices([s["symbol"] for s in states])
+        for state in states:
+            mark = marks.get(state["symbol"])
+            if not mark:
+                continue
+            try:
+                if self._detect_tp_hits(state["symbol"], mark):
+                    self.sync_protective_orders(state["symbol"])
+            except Exception as e:
+                log.warning("TP checkpoint check failed for %s: %s", state["symbol"], e)
+
+    def _detect_tp_hits(self, symbol: str, mark: Optional[float] = None) -> int:
+        """
+        Record every checkpoint (all TP levels but the last) that mark price
+        has reached and step the SL up in state. The caller syncs Bitunix.
+        Returns the number of checkpoints newly reached.
         """
         with self._tp_lock:
             state = self.db.get(symbol)
-            if not state or state["status"] != "active":
+            if not state or state["status"] != "active" or not state.get("position_opened"):
                 return 0
-            ids = self.db.loads(state.get("tp_ladder_ids"))
-            if not any(ids):
-                return 0
-            pos = self.exchange.get_open_position(symbol)
-            if not pos:
-                return 0  # closed: the close handler takes over
             levels = self.db.loads(state.get("tp_prices"))
-            pending = {str(o.get("id")) for o in self.exchange.get_tpsl_orders(symbol, pos["position_id"])}
-            is_long = state["position"] == "LONG"
-            mark = None
+            if len(levels) < 2:
+                return 0
+            if mark is None:
+                mark = self.exchange.get_mark_price(symbol)
             hits = []
-            for i, oid in enumerate(ids):
-                if not oid or str(oid) in pending or i >= len(levels):
-                    continue
-                status = self.exchange.tpsl_order_status(symbol, oid)
-                if status == "FILLED":
-                    hits.append(i)
-                elif status is None or "CANCEL" not in status and status != "FAILED":
-                    if mark is None:
-                        mark = self.exchange.get_mark_price(symbol)
-                    if (is_long and mark >= levels[i]) or (not is_long and mark <= levels[i]):
-                        log.warning("%s: TP order %s gone with status %s and mark %s past %s — counting it as hit",
-                                    symbol, oid, status, mark, levels[i])
-                        hits.append(i)
-                # cancelled or failed: not a hit, _sync_tps places it again
+            for i, level in enumerate(levels[:-1]):  # nearest first: reached ones form a prefix
+                if not self._reached(state["position"], mark, level):
+                    break
+                hits.append(i)
             if hits:
-                self._apply_tp_hits(symbol, state, hits)
+                self._apply_tp_hits(symbol, state, hits, mark)
             return len(hits)
 
-    def _apply_tp_hits(self, symbol: str, state: dict, hits: List[int]):
+    def _apply_tp_hits(self, symbol: str, state: dict, hits: List[int], mark: float):
         levels = self.db.loads(state.get("tp_prices"))
-        ids = self.db.loads(state.get("tp_ladder_ids"))
         filled = self.db.loads(state.get("filled_tp_prices"))
         first_hit = not filled
         hit_labels = [f"{self._tp_label(state, i)} {levels[i]}" for i in hits]
         filled += [levels[i] for i in hits]
-        keep = [i for i in range(len(levels)) if i not in hits]
 
-        # SL to entry after the first TP, else to the TP before the latest one; never loosen it.
+        # SL to entry at the first checkpoint, else to the checkpoint before the
+        # latest one; never loosen it (the trailing stop may already be past it).
         is_long = state["position"] == "LONG"
         entry = state.get("entry_price") or 0
         target = filled[-2] if len(filled) >= 2 else entry
         current = state.get("sl_price") or 0
         target_name = "entry" if len(filled) < 2 else f"TP{len(filled) - 1}"
         tighter = target > 0 and (current <= 0 or (target > current if is_long else target < current))
-        updates = dict(tp_prices=self.db.dumps([levels[i] for i in keep]),
-                       tp_ladder_ids=self.db.dumps([ids[i] for i in keep if i < len(ids)]),
+        updates = dict(tp_prices=self.db.dumps([lv for i, lv in enumerate(levels) if i not in hits]),
                        filled_tp_prices=self.db.dumps(filled),
                        breakeven_moved=1, breakeven_prompt_msg_id=None)
         if tighter:
             updates["sl_price"] = target
         self.db.upsert(symbol, **updates)
-        log.info("%s: %s hit — SL %s -> %s", symbol, ", ".join(hit_labels), current,
+        log.info("%s: %s reached (mark %s) — SL %s -> %s", symbol, ", ".join(hit_labels), mark, current,
                  target if tighter else f"{current} (kept, already tighter than {target_name})")
 
         sl_note = (f"SL moved to {target_name} ({target})." if tighter
                    else f"SL kept at {current} (already past {target_name}).")
-        self.notify(f"🎯 {' & '.join(hit_labels)} hit on {symbol} — {sl_note}")
+        self.notify(f"🎯 {' & '.join(hit_labels)} reached on {symbol} — {sl_note}")
         if first_hit:
             self._activate_trailing_if_needed(symbol)
 
     def sync_protective_orders(self, symbol: str) -> bool:
         """
-        Make Bitunix's SL and TP ladder match state. Returns True when the SL
-        is in place (or there's no position yet), False when it could not be
+        Make Bitunix's SL and last TP match state. Returns True when the SL is
+        in place (or there's no position yet), False when it could not be
         set — in which case the user has been alerted. A TP failure alerts on
         its own and never blocks the SL.
 
-        Bitunix has no native trailing stop: update_trailing_stops() ratchets
-        sl_price in the DB and calls this, so the SL on Bitunix is always the
-        one in state.
+        Bitunix has no native trailing stop: update_trailing_stops() and the
+        TP checkpoints move sl_price in the DB and call this, so the SL on
+        Bitunix is always the one in state.
         """
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
@@ -582,7 +556,7 @@ class TradeManager:
             if self._detect_tp_hits(symbol):
                 state = self.db.get(symbol)  # SL may have stepped up
         except Exception as e:
-            log.warning("TP hit check failed for %s: %s", symbol, e)
+            log.warning("TP checkpoint check failed for %s: %s", symbol, e)
         raw_sl = state.get("sl_price") or 0
         if raw_sl <= 0:
             log.warning("%s has no SL on record — nothing to sync", symbol)
@@ -605,7 +579,7 @@ class TradeManager:
                         f"⚠️ Could not set SL {sl_price} on {symbol}: {e}\n"
                         f"The position may be UNPROTECTED — check Bitunix. Bot will keep retrying.")
             return False
-        # After the SL so the TP/SL orders set_position_sl created get the final TP too.
+        # After the SL so the TP/SL orders set_position_sl created get the TP too.
         self._sync_tps_and_alert(symbol, position)
         return True
 
@@ -620,35 +594,6 @@ class TradeManager:
                         f"⚠️ TP problem on {symbol}: " + "; ".join(problems) +
                         f"\nSL is unaffected. Bot will keep retrying — or change TPs with /tp {symbol} <p1> [p2 ...].")
         return changes
-
-    def handle_exit_fill(self, symbol: str, fill_price: float):
-        """
-        A closing (opposite-side) market fill. If a ladder TP fired, record it
-        and step the SL up — the rest of the position stays open. Otherwise it
-        is an SL (or a manual close): cancel everything and close what's left.
-        """
-        state = self.db.get(symbol)
-        if not state or state["status"] != "active":
-            return
-        if self.db.loads(state.get("tp_ladder_ids")):
-            for attempt in range(3):
-                try:
-                    if self._detect_tp_hits(symbol):
-                        self.sync_protective_orders(symbol)
-                        return
-                    if not self.exchange.get_open_position(symbol):
-                        break  # fully closed: not a partial TP
-                except Exception as e:
-                    log.warning("TP hit check after %s fill failed: %s", symbol, e)
-                time.sleep(1)
-            if self.exchange.get_open_position(symbol) and self.classify_exit(symbol, fill_price) == "TP":
-                # Looks like a TP but Bitunix hasn't confirmed which order yet — the watchdog will.
-                log.warning("%s: partial close at %s looks like a TP but no ladder order matched yet — "
-                            "leaving the position open", symbol, fill_price)
-                return
-        source = self.classify_exit(symbol, fill_price)
-        log.info("%s fill detected: %s at %s", source, symbol, fill_price)
-        self.handle_sl_fill(symbol, source)
 
     # ---------- manual TP detection (user places TPs on Bitunix UI) ----------
 
@@ -1063,8 +1008,8 @@ class TradeManager:
     def _tp_plan_text(n: int) -> str:
         if n <= 1:
             return "  The TP closes the whole position."
-        return (f"  Each of the first {n - 1} TPs closes ~1/{n} of the position, the last closes the rest.\n"
-                f"  SL moves to entry when the first TP hits, then to the previous TP after each later one.")
+        return (f"  The first {n - 1} TPs only move the SL: to entry at the first, then to the previous TP.\n"
+                f"  Nothing is closed until the last TP (or the SL).")
 
     def stage_modify_tp(self, symbol: str, new_prices: List[float]) -> str:
         state = self.db.get(symbol)
@@ -1154,20 +1099,12 @@ class TradeManager:
         elif mod_type == "tp":
             new_prices = self._order_tps(state["position"], params["new_prices"])
             prices = ", ".join(str(t) for t in new_prices)
-            try:
-                # Record a ladder TP that just fired first, or the sync would place it again.
-                hit = self._detect_tp_hits(symbol)
-            except Exception as e:
-                log.warning("TP hit check failed for %s: %s", symbol, e)
-                hit = 0
             self.db.upsert(symbol, tp_prices=self.db.dumps(new_prices))
-            changes, problems, pos = [], [], None
+            problems, pos = [], None
             try:
                 pos = self.exchange.get_open_position(symbol)
                 if pos:
-                    if hit:
-                        self.sync_protective_orders(symbol)  # step the SL up
-                    changes, problems = self._sync_tps(symbol, pos)
+                    _, problems = self._sync_tps(symbol, pos)
                 else:
                     state = self.db.get(symbol)
                     problems = self._sync_resting_orders(
@@ -1178,15 +1115,9 @@ class TradeManager:
             if problems:
                 return (f"⚠️ TPs for {symbol} saved as {prices} but Bitunix did NOT take all of it:\n- "
                         + "\n- ".join(problems) + "\nBot will keep retrying; check Bitunix.")
-            if pos:
-                n_place, _ = self._tp_plan(symbol, new_prices, pos["size"])
-                if n_place < len(new_prices):
-                    return (f"✅ TPs saved for {symbol}: {prices}\n  Position size {pos['size']} is too small "
-                            f"to split {len(new_prices)} ways — on Bitunix: "
-                            f"{', '.join(str(t) for t in new_prices[:n_place])} (the last closes the rest).")
-                return f"✅ TPs set on Bitunix for {symbol}: {prices}\n{self._tp_plan_text(len(new_prices))}"
-            return (f"✅ TPs saved for {symbol}: {prices}. The last one is on the entry order; "
-                    f"the others are placed once it fills.")
+            where = "on the position" if pos else "on the entry order"
+            return (f"✅ TPs set for {symbol}: {prices}\n  Last TP {new_prices[-1]} is on Bitunix {where}.\n"
+                    + self._tp_plan_text(len(new_prices)))
 
         elif mod_type == "dca":
             new_price = params["new_price"]

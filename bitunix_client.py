@@ -23,7 +23,6 @@ import functools
 import hashlib
 import json
 import logging
-import math
 import threading
 import time
 import uuid
@@ -140,7 +139,6 @@ class BitunixClient:
         self._ws_last_msg = 0.0
         self._ws_callbacks = None
         self._tpsl_triggers = {}  # symbol -> ("SL"|"TP"|"TP/SL", time) of the last fired TP/SL
-        self._tpsl_closed = {}  # TP/SL order id -> (final status, time), from the tpsl push
 
     @staticmethod
     def _norm(symbol: str) -> str:
@@ -592,9 +590,8 @@ class BitunixClient:
     @_retry()
     def set_position_tp(self, symbol: str, tp_price: float, exclude_ids=()) -> bool:
         """
-        Make every TP/SL order on the open position (except exclude_ids, the
-        partial TP ladder) take profit at tp_price and make sure the whole
-        position is covered. Call after set_position_sl so the SL orders it
+        Make every TP/SL order on the open position (except exclude_ids)
+        take profit at tp_price and make sure the whole position is covered. Call after set_position_sl so the SL orders it
         creates also get the TP. Returns True if anything changed; raises on failure.
         """
         symbol = self._norm(symbol)
@@ -628,33 +625,8 @@ class BitunixClient:
             log.info("%s: placed position TP at %s (size %s)", symbol, tp_str, size)
         return changed
 
-    # ---------- partial TP ladder (TP-only orders that close part of the position) ----------
-
-    def place_partial_tp(self, symbol: str, position_id: str, tp_price: float, qty: float) -> str:
-        symbol = self._norm(symbol)
-        data = _as_obj(self._post("/api/v1/futures/tpsl/place_order", {
-            "symbol": symbol, "positionId": position_id,
-            "tpPrice": self._fmt_price(symbol, tp_price), "tpStopType": STOP_TYPE,
-            "tpOrderType": "MARKET", "tpQty": self._fmt_qty(symbol, qty)}))
-        return str(data.get("orderId") or data.get("id") or "")
-
-    def modify_partial_tp(self, symbol: str, order_id: str, tp_price: float, qty: float):
-        symbol = self._norm(symbol)
-        self._post("/api/v1/futures/tpsl/modify_order", {
-            "orderId": str(order_id),
-            "tpPrice": self._fmt_price(symbol, tp_price), "tpStopType": STOP_TYPE,
-            "tpOrderType": "MARKET", "tpQty": self._fmt_qty(symbol, qty)})
-
     def cancel_tpsl(self, symbol: str, order_id: str):
         self._post("/api/v1/futures/tpsl/cancel_order", {"symbol": self._norm(symbol), "orderId": str(order_id)})
-
-    def min_qty(self, symbol: str) -> float:
-        return _f(self.get_instrument_info(symbol).get("minTradeVolume"))
-
-    def floor_qty(self, symbol: str, qty: float) -> float:
-        """Round qty DOWN to the symbol's precision (never more than asked, unlike round_qty)."""
-        step = 10 ** self._qty_decimals(symbol)
-        return math.floor(qty * step + 1e-9) / step
 
     def cancel_order(self, symbol: str, order_id: str):
         symbol = self._norm(symbol)
@@ -801,18 +773,9 @@ class BitunixClient:
                 log.exception("WebSocket %s handler failed for %s", ch, item)
 
     def _record_trigger(self, item: dict):
-        # A fired TP/SL is pushed (CLOSE + FILLED) just before its market order
-        # fills; remember which order and which side fired so the fill can be
-        # matched to a TP level and a close can be labelled.
-        if str(item.get("event")).upper() != "CLOSE":
-            return
-        status = str(item.get("status")).upper()
-        now = time.time()
-        if item.get("orderId"):
-            self._tpsl_closed[str(item["orderId"])] = (status, now)
-            for oid in [k for k, (_, ts) in self._tpsl_closed.items() if now - ts > 86400]:
-                del self._tpsl_closed[oid]
-        if status != "FILLED":
+        # A fired TP/SL is pushed (CLOSE + FILLED) just before the position
+        # closes; remember which side fired so the close can be labelled.
+        if str(item.get("event")).upper() != "CLOSE" or str(item.get("status")).upper() != "FILLED":
             return
         sl, tp = _f(item.get("slPrice")) > 0, _f(item.get("tpPrice")) > 0
         kind = "SL" if sl and not tp else "TP" if tp and not sl else "TP/SL"
@@ -822,24 +785,6 @@ class BitunixClient:
         """'SL', 'TP' or 'TP/SL' if a TP/SL order on symbol fired in the last `within` seconds."""
         kind, ts = self._tpsl_triggers.get(self._norm(symbol), (None, 0))
         return kind if time.time() - ts <= within else None
-
-    def tpsl_order_status(self, symbol: str, order_id: str) -> str | None:
-        """
-        Final status of a TP/SL order that is no longer pending: FILLED (it
-        triggered), CANCELED, SYSTEM_CANCELED, FAILED, or None if unknown.
-        The WebSocket push is checked first, then REST history.
-        """
-        status, _ = self._tpsl_closed.get(str(order_id), (None, 0))
-        if status:
-            return status
-        try:
-            data = self._get("/api/v1/futures/tpsl/get_history_orders", symbol=self._norm(symbol), limit=100)
-            for o in _as_list(data, "orderList"):
-                if str(o.get("id") or o.get("orderId")) == str(order_id):
-                    return str(o.get("status") or "").upper() or None
-        except Exception as e:
-            log.warning("TP/SL history lookup failed for %s %s: %s", symbol, order_id, e)
-        return None
 
     def ws_is_healthy(self) -> bool:
         """False when the socket thread died or nothing (not even a pong) arrived recently."""

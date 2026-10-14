@@ -120,10 +120,10 @@ async def _handle_fill_async(item: dict, state: dict | None, trade_manager: Trad
         return
     elif state["status"] == "active":
         if item["order_type"] == "MARKET":
-            # TP/SL triggers execute as market orders on Bitunix. A partial TP
-            # leaves the position open; anything else closes out the trade.
-            log.info("Closing fill: %s %s at %s", symbol, order_id, item["avg_price"])
-            await asyncio.to_thread(trade_manager.handle_exit_fill, symbol, item["avg_price"])
+            # TP/SL triggers execute as market orders on Bitunix.
+            source = await asyncio.to_thread(trade_manager.classify_exit, symbol, item["avg_price"])
+            log.info("%s fill detected: %s %s at %s", source, symbol, order_id, item["avg_price"])
+            await asyncio.to_thread(trade_manager.handle_sl_fill, symbol, source)
         else:
             log.info("Manual TP fill detected: %s %s", symbol, order_id)
             await _handle_manual_tp(symbol, trade_manager, tg_app, db)
@@ -249,10 +249,14 @@ def _start_watchdog(exchange: BitunixClient, trade_manager: TradeManager, notify
 
 
 def _start_trailing_loop(trade_manager: TradeManager):
-    """Background thread: bot-side trailing stop (Bitunix has no native one)."""
+    """Background thread: bot-side trailing stop and TP checkpoints (Bitunix has neither)."""
     def run():
         while True:
             time.sleep(config.TRAILING_INTERVAL_SECONDS)
+            try:
+                trade_manager.check_tp_checkpoints()
+            except Exception as e:
+                log.warning("TP checkpoint iteration failed: %s", e)
             try:
                 trade_manager.update_trailing_stops()
             except Exception as e:

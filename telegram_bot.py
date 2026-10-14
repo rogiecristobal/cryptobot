@@ -251,8 +251,8 @@ def build_app(manager_ref):
         if len(args) < 2:
             await update.message.reply_text(
                 "Usage: /tp <SYMBOL> <tp1> [tp2 tp3 ...]\n"
-                "Each TP but the last closes an equal share of the position; the last closes the rest.\n"
-                "SL moves to entry when the first TP hits, then to the previous TP after each later one."
+                "Only the last TP closes the position. Earlier TPs just move the SL:\n"
+                "to entry when price reaches the first, then to the previous TP at each later one."
             )
             return
         symbol = args[0].upper()
@@ -357,7 +357,7 @@ def build_app(manager_ref):
             "  Options: TP <p1> [p2 p3] DCA <price> RISK <%> LEVERAGEx\n"
             "  Example: /place BTC LONG market SL 67000 TP 71000 RISK 3 5x\n\n"
             "/sl <SYMBOL> <price>     \u2014 Modify stop loss\n"
-            "/tp <SYMBOL> <p1> [p2 p3] \u2014 Set TPs (split evenly, SL steps up on each hit)\n"
+            "/tp <SYMBOL> <p1> [p2 p3] \u2014 Set TPs (last one closes; earlier ones move SL)\n"
             "/dca <SYMBOL> [price]    \u2014 Add/remove DCA order\n"
             "/entry <SYMBOL> <price>  \u2014 Modify entry (pending only)\n"
             "/trail <SYMBOL> [mult]   \u2014 Set trailing stop (default 1R)\n"
