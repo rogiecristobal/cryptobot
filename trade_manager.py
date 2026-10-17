@@ -5,6 +5,7 @@ Core trade lifecycle:
   -> on TP1 fill: move SL to breakeven
   -> on SL fill: cancel everything else for that symbol, close out state
 """
+import dataclasses
 import logging
 import threading
 import time
@@ -160,6 +161,7 @@ class TradeManager:
             raise ValueError("Signal rejected:\n- " + "\n- ".join(signal.errors))
 
         symbol = signal.asset
+        self._validate_levels(signal)
         signal.tps = self._order_tps(signal.position, signal.tps)
         self.exchange.check_tradable(symbol)
         if self.exchange.has_open_orders_or_position(symbol):
@@ -240,6 +242,26 @@ class TradeManager:
         return "\n".join(lines), token
 
     @staticmethod
+    def _validate_levels(signal: ParsedSignal):
+        """Entry, SL, TPs and DCA on the right side of each other (the mark-price checks come after)."""
+        if not signal.sl or signal.sl <= 0:
+            raise ValueError("SL is required. Use: SL <price>")
+        if signal.entry_is_market:
+            return
+        if not signal.entry or signal.entry <= 0:
+            raise ValueError(f"Invalid entry {signal.entry}.")
+        long = signal.position == "LONG"
+        below, above = ("below", "above") if long else ("above", "below")
+        entry = signal.entry
+        if (signal.sl >= entry) if long else (signal.sl <= entry):
+            raise ValueError(f"For {signal.position}, SL {signal.sl} must be {below} entry {entry}.")
+        for tp in signal.tps:
+            if (tp <= entry) if long else (tp >= entry):
+                raise ValueError(f"For {signal.position}, TP {tp} must be {above} entry {entry}.")
+        if signal.dca is not None and ((signal.dca >= entry) if long else (signal.dca <= entry)):
+            raise ValueError(f"For {signal.position}, DCA {signal.dca} must be {below} entry {entry}.")
+
+    @staticmethod
     def _new_token() -> str:
         """Ties a Telegram card's buttons to the staged trade/modification it shows."""
         return uuid.uuid4().hex[:8]
@@ -314,7 +336,7 @@ class TradeManager:
         trailing_distance = None
         if signal.trailing_r_mult is not None and not signal.entry_is_market and signal.entry and signal.sl:
             # Market entries get their distance after the fill (handle_entry_or_dca_fill)
-            td = round(abs(signal.entry - signal.sl) * signal.trailing_r_mult, 2)
+            td = self.exchange.round_price(symbol, abs(signal.entry - signal.sl) * signal.trailing_r_mult)
             trailing_distance = td if td > 0 else None
 
         # Persist the trade BEFORE placing any order. A limit priced at/through
@@ -425,6 +447,13 @@ class TradeManager:
         """The last TP level, rounded for Bitunix — the only TP placed on the exchange."""
         tps = self.db.loads(state.get("tp_prices"))
         return self.exchange.round_price(symbol, tps[-1]) if tps else None
+
+    def _px(self, symbol: str, price) -> str:
+        """Price for a message, at the symbol's precision (falls back to plain str)."""
+        try:
+            return self.exchange.format_price(symbol, float(price))
+        except Exception:
+            return str(price)
 
     @staticmethod
     def _same_price(a: float, b: float) -> bool:
@@ -703,7 +732,7 @@ class TradeManager:
         r_mult = state.get("trailing_r_mult", "?")
         log.info("Trailing stop armed for %s: %.2f USDT (%sR), activation=%s",
                  symbol, distance, r_mult, activation)
-        self.notify(f"↗️ Trailing armed on {symbol}: −${distance:,.0f} ({r_mult}R), "
+        self.notify(f"↗️ Trailing armed on {symbol}: −{self._px(symbol, distance)} ({r_mult}R), "
                     f"starts once price reaches {activation:g}")
         return True
 
@@ -838,7 +867,7 @@ class TradeManager:
                 sl_price = state.get("sl_price", 0)
                 if sl_price > 0 and r_mult > 0:
                     risk = abs(avg_price - sl_price)
-                    td = round(risk * r_mult, 2)
+                    td = self.exchange.round_price(symbol, risk * r_mult)
                     if td > 0:
                         self.db.upsert(symbol, trailing_distance=td)
             # Only check SL breach on the initial entry fill (not DCA fills)
@@ -961,12 +990,13 @@ class TradeManager:
         if not state.get("trailing_distance"):
             return f"No trailing stop active on {symbol}."
 
-        original_sl = state.get("original_sl_price")
+        # The SL stays where trailing (or a TP checkpoint) left it. Restoring the
+        # original SL would hand back the profit it had locked in; /sl can
+        # still move it anywhere.
         self.db.upsert(symbol, trailing_distance=None, trailing_r_mult=None, trailing_peak=None)
-        if original_sl and float(original_sl) > 0:
-            self.db.upsert(symbol, sl_price=float(original_sl))
-            self.sync_protective_orders(symbol)
-            return f"Trailing cancelled for {symbol}. SL restored to {original_sl}."
+        sl = state.get("sl_price")
+        if sl:
+            return f"Trailing cancelled for {symbol}. SL stays at {self._px(symbol, sl)}."
         return f"Trailing cancelled for {symbol}."
 
     def stage_modify_trail(self, symbol: str, mult: float) -> tuple[str, str]:
@@ -983,12 +1013,12 @@ class TradeManager:
         if entry <= 0 or float(original_sl) <= 0:
             raise ValueError(f"Cannot determine R (entry={entry}, original_sl={original_sl})")
         risk = abs(entry - float(original_sl))
-        td = round(risk * mult, 2)
+        td = self.exchange.round_price(symbol, risk * mult)
         prompt = (
             f"Set trailing stop for {symbol}?\n"
-            f"  R (entry − original SL): ${risk:,.0f}\n"
+            f"  R (entry − original SL): {self._px(symbol, risk)}\n"
             f"  Multiplier: {mult}R\n"
-            f"  Distance: ${td:,.0f} retracement from peak"
+            f"  Distance: {self._px(symbol, td)} retracement from peak"
         )
         return prompt, self._stage_mod(symbol, "trail", {"distance": td, "r_mult": mult})
 
@@ -1048,13 +1078,27 @@ class TradeManager:
             )
         return qty, remaining, risk_amount, dca_risk
 
+    def amend_pending(self, symbol: str, **changes) -> Optional[ParsedSignal]:
+        """
+        A copy of the trade still waiting for Confirm on `symbol`, with
+        `changes` applied — for re-staging as a fresh, re-validated and
+        re-sized card. None if no trade is waiting (or one is already active).
+        """
+        state = self.db.get(symbol)
+        if state and state["status"] == "active":
+            return None
+        with self._lock:
+            entry = self.pending.get(symbol)
+            if not entry:
+                return None
+            signal = entry["signal"]
+            fields = {"tps": list(signal.tps), "errors": []}
+            fields.update(changes)
+            return dataclasses.replace(signal, **fields)
+
     def stage_modify_sl(self, symbol: str, new_sl: float) -> tuple[str, str]:
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
-            if symbol in self.pending:
-                signal = self.pending[symbol]["signal"]
-                prompt = f"Modify SL for {symbol}?\n  Current: {signal.sl}\n  New: {new_sl}"
-                return prompt, self._stage_mod(symbol, "sl", {"new_price": new_sl})
             raise ValueError(f"No active position or pending trade for {symbol}.")
 
         if new_sl <= 0:
@@ -1097,14 +1141,6 @@ class TradeManager:
     def stage_modify_tp(self, symbol: str, new_prices: List[float]) -> tuple[str, str]:
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
-            if symbol in self.pending:
-                signal = self.pending[symbol]["signal"]
-                self._validate_tps(symbol, signal.position, new_prices)
-                new_prices = self._order_tps(signal.position, new_prices)
-                old = ", ".join(str(t) for t in signal.tps) or "none"
-                prompt = (f"Modify TPs for {symbol}?\n  Current: {old}\n"
-                          f"  New: {', '.join(str(t) for t in new_prices)}\n{self._tp_plan_text(len(new_prices))}")
-                return prompt, self._stage_mod(symbol, "tp", {"new_prices": new_prices})
             raise ValueError(f"No active position or pending trade for {symbol}.")
 
         self._validate_tps(symbol, state["position"], new_prices)
@@ -1120,13 +1156,6 @@ class TradeManager:
     def stage_modify_dca(self, symbol: str, dca_price: Optional[float]) -> tuple[str, str]:
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
-            if symbol in self.pending:
-                signal = self.pending[symbol]["signal"]
-                if dca_price is None:
-                    prompt = f"Remove DCA for {symbol}?"
-                else:
-                    prompt = f"Add DCA for {symbol}?\n  Price: {dca_price}"
-                return prompt, self._stage_mod(symbol, "dca", {"new_price": dca_price})
             raise ValueError(f"No active position or pending trade for {symbol}.")
 
         if dca_price is None:
@@ -1136,13 +1165,6 @@ class TradeManager:
             prompt = (f"Modify DCA for {symbol}?\n  Price: {dca_price}  (qty ~{qty})\n"
                       f"  Risks ${dca_risk:,.2f} of the ${remaining:,.2f} left in the ${risk_amount:,.2f} budget")
         return prompt, self._stage_mod(symbol, "dca", {"new_price": dca_price})
-
-    def stage_modify_entry(self, symbol: str, new_price: Optional[float], is_market: bool) -> tuple[str, str]:
-        if symbol in self.pending:
-            entry_desc = "MARKET" if is_market else new_price
-            prompt = f"Modify Entry for {symbol}?\n  New: {entry_desc}"
-            return prompt, self._stage_mod(symbol, "entry", {"new_price": new_price, "is_market": is_market})
-        raise ValueError(f"No pending trade for {symbol} — entry can only be modified before confirmation.")
 
     def apply_modification(self, symbol: str, token: Optional[str]) -> str:
         with self._lock:
@@ -1156,18 +1178,8 @@ class TradeManager:
         mod_type = mod["type"]
         params = mod["params"]
         state = self.db.get(symbol)
-        if not state:
-            with self._lock:
-                pend = self.pending.get(symbol)
-                if pend and mod_type == "tp":
-                    pend["signal"].tps = list(params["new_prices"])
-            if pend and mod_type == "tp":
-                return (f"✅ TPs for pending {symbol} set to {', '.join(str(t) for t in params['new_prices'])} "
-                        f"— tap Confirm on the trade card to place them.")
-            if pend:
-                return (f"⚠️ Changing the {mod_type.upper()} of an unconfirmed trade isn't supported yet — "
-                        f"nothing changed. Cancel the trade card and send /place again.")
-            return f"No active position for {symbol}."
+        if not state or state["status"] != "active":
+            return f"No active position for {symbol} — nothing changed."
 
         if mod_type == "sl":
             if state.get("trailing_distance"):
@@ -1249,7 +1261,7 @@ class TradeManager:
             self.db.upsert(symbol, trailing_distance=distance, trailing_r_mult=r_mult, trailing_peak=None)
             if state.get("breakeven_moved"):
                 self._activate_trailing_if_needed(symbol)
-            return f"✅ Trailing stop set for {symbol}: −${distance:,.0f} ({r_mult}R)."
+            return f"✅ Trailing stop set for {symbol}: −{self._px(symbol, distance)} ({r_mult}R)."
 
         return f"Unknown modification type: {mod_type}"
 
@@ -1300,11 +1312,11 @@ class TradeManager:
             if state.get("trailing_distance") and state.get("breakeven_moved"):
                 dist = float(state["trailing_distance"])
                 r_mult = state.get("trailing_r_mult")
-                trail_info = f"\n  Trailing: −${dist:,.0f} from peak" + (f" ({r_mult}R)" if r_mult else "")
+                trail_info = f"\n  Trailing: −{self._px(sym, dist)} from peak" + (f" ({r_mult}R)" if r_mult else "")
 
             lines.append(
                 f"\n{sym} {side}{be}"
-                f"\n  Entry: {entry:,.1f} | Mark: {mark:,.1f}"
+                f"\n  Entry: {self._px(sym, entry)} | Mark: {self._px(sym, mark)}"
                 f"\n  PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)"
                 f"\n  SL: {sl} | TP: {tps}"
                 f"{dca_info}{trail_info}"

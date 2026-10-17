@@ -137,6 +137,7 @@ class BitunixClient:
         self._ws_thread = None
         self._ws_stop = None
         self._ws_logged_in = threading.Event()
+        self.ws_login_error = None  # Bitunix's reply when it last rejected the login, else None
         self._ws_last_msg = 0.0
         self._ws_callbacks = None
         self._tpsl_triggers = {}  # symbol -> ("SL"|"TP"|"TP/SL", time) of the last fired TP/SL
@@ -287,6 +288,10 @@ class BitunixClient:
 
     def _fmt_price(self, symbol: str, price: float) -> str:
         return f"{price:.{self._price_decimals(symbol)}f}"
+
+    def format_price(self, symbol: str, price: float) -> str:
+        """Price (or price distance) at the symbol's own precision, for messages: 1.4321, not 1.4."""
+        return self._fmt_price(self._norm(symbol), price)
 
     def get_tickers(self, symbols: list[str]) -> dict:
         symbols = [self._norm(s) for s in symbols]
@@ -754,8 +759,10 @@ class BitunixClient:
                 or msg.get("code") not in (None, 0, "0")
             if failed:
                 log.error("Bitunix WebSocket login rejected: %s", msg)
+                self.ws_login_error = str(msg.get("msg") or msg.get("data") or msg)[:200]
                 return
             log.info("Bitunix private WebSocket logged in")
+            self.ws_login_error = None
             self._ws_logged_in.set()
             app.send(json.dumps({"op": "subscribe",
                                  "args": [{"ch": "order"}, {"ch": "position"}, {"ch": "tpsl"}]}))
@@ -793,9 +800,15 @@ class BitunixClient:
         return kind if time.time() - ts <= within else None
 
     def ws_is_healthy(self) -> bool:
-        """False when the socket thread died or nothing (not even a pong) arrived recently."""
+        """
+        False when the socket thread died, nothing (not even a pong) arrived
+        recently, or it isn't logged in. Bitunix answers pings on a socket
+        whose login it rejected, but pushes no fills on it.
+        """
         thread = self._ws_thread
         if thread is None or not thread.is_alive():
+            return False
+        if not self._ws_logged_in.is_set():
             return False
         return time.time() - self._ws_last_msg < self.WS_STALE_SECONDS
 

@@ -64,7 +64,21 @@ applied automatically on startup — there is nothing to migrate by hand.
 
 ### Update notes (newest first)
 
-- **Safety fixes** (this update). Optional `.env` addition:
+- **Default risk 2%, trailing and editing fixes** (this update).
+  - The default `RISK_PERCENT` is now **2%**, but your `.env` overrides it.
+    Check yours with `grep RISK_PERCENT .env`. To use 2%:
+    ```bash
+    sed -i 's/^RISK_PERCENT=.*/RISK_PERCENT=2.0/' .env
+    ```
+  - `/trail <SYMBOL> off` now leaves the SL where it is. It used to move it
+    back to the original SL, giving back profit already locked in.
+  - Trailing now works on low-priced coins. The distance used to be rounded
+    to 2 decimals, which switched trailing off on coins priced like PEPE.
+  - Before you tap Confirm, `/sl`, `/tp`, `/dca` and `/entry` send a fresh
+    trade card with the change, re-checked and re-sized. `/entry` works again.
+  - The "Bitunix connection" alert now says if Bitunix rejected the login,
+    and repeats at most every 10 minutes.
+- **Safety fixes** (`da752e4`). Optional `.env` addition:
   `MAX_RISK_PERCENT=5.0` (the default if missing) — no trade can risk more.
   - Only **one copy** of the bot can run. A second copy on the same device
     stops at once; one on another device stops after a ~10s check at startup
@@ -109,6 +123,8 @@ applied automatically on startup — there is nothing to migrate by hand.
   (not margin %) against the entry→SL distance, and replies with a summary.
 - Reply `✅` within `CONFIRM_TIMEOUT_SECONDS` (default 120s) to actually place
   orders. Anything else, or timeout, and nothing happens.
+- Before you confirm, `/sl`, `/tp`, `/dca` or `/entry` on that symbol sends a
+  fresh card with the change, re-checked and re-sized, and retires the old one.
 - No stop loss detected in the signal → **hard rejected**, no trade placed, no exceptions.
 - If a DCA level is present, position size is split between the entry order
   and the DCA order per `DCA_SPLIT_RATIO` (default 0.5 = 50/50), sized so that
@@ -141,7 +157,8 @@ applied automatically on startup — there is nothing to migrate by hand.
   that differs from the bot's is reset, and a dead Bitunix WebSocket is restarted.
 - **Trailing stop is bot-side.** Bitunix has no trailing-stop API, so every
   `TRAILING_INTERVAL_SECONDS` (default 5s) the bot reads mark price and ratchets
-  the SL to peak − distance. It only trails while the bot is running; if the
+  the SL to peak − distance. `/trail <SYMBOL> off` stops trailing and leaves
+  the SL where it is. It only trails while the bot is running; if the
   bot goes offline, the last SL it set stays on Bitunix.
 
 ## Known simplifications (read before relying on this)

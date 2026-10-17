@@ -19,7 +19,7 @@ BITUNIX_API_SECRET = _required("BITUNIX_API_SECRET")
 TELEGRAM_BOT_TOKEN = _required("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = int(_required("TELEGRAM_CHAT_ID"))
 
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "3.0"))
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "2.0"))
 if not 0 < RISK_PERCENT <= 100:
     raise RuntimeError(f"RISK_PERCENT must be between 0 and 100, got {RISK_PERCENT}")
 

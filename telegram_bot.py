@@ -4,6 +4,7 @@ this is the single most important security boundary in the whole bot.
 """
 import asyncio
 import logging
+import math
 import platform
 import time
 from typing import Optional, List
@@ -22,18 +23,24 @@ def _authorized(update: Update) -> bool:
 
 def _parse_float(s: str) -> Optional[float]:
     try:
-        return float(s)
+        val = float(s)
     except (ValueError, TypeError):
         return None
+    return val if math.isfinite(val) else None  # "nan"/"inf" parse as floats but aren't prices
 
 
 _LABELS = {"sl", "tp", "dca", "risk", "trail"}
 
 
-async def _stage_signal(update: Update, trade_manager, signal: ParsedSignal):
-    """Stage a pre-built ParsedSignal and reply with the confirmation card."""
+async def _stage_signal(update: Update, trade_manager, signal: ParsedSignal, note: str = ""):
+    """Stage a pre-built ParsedSignal and reply with the confirmation card.
+    A card it replaces (same symbol, not yet confirmed) is marked as replaced."""
+    old = trade_manager.get_pending(signal.asset)
+    old_card = (old["chat_id"], old["message_id"]) if old and old.get("message_id") else None
     try:
         prompt, token = await asyncio.to_thread(trade_manager.stage_signal, signal)
+        if note:
+            prompt = f"{note}\n\n{prompt}"
         # The token ties the buttons to this exact trade: a newer card for the
         # same symbol replaces it, and this card's buttons then do nothing.
         keyboard = [
@@ -44,6 +51,13 @@ async def _stage_signal(update: Update, trade_manager, signal: ParsedSignal):
         ]
         sent_msg = await update.message.reply_text(prompt, reply_markup=InlineKeyboardMarkup(keyboard))
         trade_manager.set_pending_metadata(signal.asset, sent_msg.chat_id, sent_msg.message_id)
+        if old_card:
+            try:
+                await update.get_bot().edit_message_text(
+                    chat_id=old_card[0], message_id=old_card[1],
+                    text=f"✏️ Replaced by a newer {signal.asset} card below — use that one.")
+            except Exception:
+                pass
     except ValueError as e:
         await update.message.reply_text(str(e))
     except Exception as e:
@@ -192,28 +206,7 @@ def build_app(manager_ref):
             await update.message.reply_text("SL is required. Use: SL <price>")
             return
 
-        if not entry_is_market:
-            if direction == "LONG" and sl >= entry:
-                await update.message.reply_text("For LONG, SL must be below entry.")
-                return
-            if direction == "SHORT" and sl <= entry:
-                await update.message.reply_text("For SHORT, SL must be above entry.")
-                return
-            for tp in tps:
-                if direction == "LONG" and tp <= entry:
-                    await update.message.reply_text(f"For LONG, TP {tp} must be above entry {entry}.")
-                    return
-                if direction == "SHORT" and tp >= entry:
-                    await update.message.reply_text(f"For SHORT, TP {tp} must be below entry {entry}.")
-                    return
-            if dca is not None:
-                if direction == "LONG" and dca >= entry:
-                    await update.message.reply_text(f"For LONG, DCA {dca} must be below entry {entry}.")
-                    return
-                if direction == "SHORT" and dca <= entry:
-                    await update.message.reply_text(f"For SHORT, DCA {dca} must be above entry {entry}.")
-                    return
-
+        # Entry/SL/TP/DCA ordering is checked in stage_signal, so re-staged cards get it too.
         signal = ParsedSignal(
             asset=asset,
             position=direction,
@@ -233,6 +226,22 @@ def build_app(manager_ref):
 
     # ---------- /sl, /tp, /dca, /entry ----------
 
+    async def _change(update: Update, symbol: str, note: str, mod_func, mod_args: tuple, **changes):
+        """
+        A trade still waiting for Confirm gets a fresh card with the change —
+        re-validated and re-sized, replacing the old card. An active trade gets
+        a modification card instead (mod_func None: not possible once active).
+        """
+        trade_manager = manager_ref.tm
+        amended = trade_manager.amend_pending(symbol, **changes)
+        if amended is not None:
+            await _stage_signal(update, trade_manager, amended, note=note)
+        elif mod_func is None:
+            await update.message.reply_text(
+                f"No unconfirmed trade for {symbol} — the entry can only be changed before you tap Confirm.")
+        else:
+            await _stage_modification(update, trade_manager, mod_func, symbol, *mod_args)
+
     async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _authorized(update):
             return
@@ -247,7 +256,8 @@ def build_app(manager_ref):
         if price is None:
             await update.message.reply_text(f"Invalid price: {args[1]}")
             return
-        await _stage_modification(update, manager_ref.tm, manager_ref.tm.stage_modify_sl, symbol, price)
+        await _change(update, symbol, f"✏️ SL changed to {price}.", manager_ref.tm.stage_modify_sl, (price,),
+                      sl=price)
 
     async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _authorized(update):
@@ -270,7 +280,8 @@ def build_app(manager_ref):
                 await update.message.reply_text(f"Invalid price: {a}")
                 return
             prices.append(p)
-        await _stage_modification(update, manager_ref.tm, manager_ref.tm.stage_modify_tp, symbol, prices)
+        await _change(update, symbol, f"✏️ TPs changed to {', '.join(str(p) for p in prices)}.",
+                      manager_ref.tm.stage_modify_tp, (prices,), tps=prices)
 
     async def dca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _authorized(update):
@@ -283,13 +294,14 @@ def build_app(manager_ref):
         if not symbol.endswith("USDT"):
             symbol += "USDT"
         if len(args) < 2 or args[1].lower() in ("remove", "none", "0"):
-            await _stage_modification(update, manager_ref.tm, manager_ref.tm.stage_modify_dca, symbol, None)
+            price, note = None, "✏️ DCA removed."
         else:
             price = _parse_float(args[1])
             if price is None:
                 await update.message.reply_text(f"Invalid price: {args[1]}")
                 return
-            await _stage_modification(update, manager_ref.tm, manager_ref.tm.stage_modify_dca, symbol, price)
+            note = f"✏️ DCA set to {price}."
+        await _change(update, symbol, note, manager_ref.tm.stage_modify_dca, (price,), dca=price)
 
     async def entry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _authorized(update):
@@ -306,7 +318,8 @@ def build_app(manager_ref):
         if not is_market and new_price is None:
             await update.message.reply_text(f"Invalid price: {args[1]}")
             return
-        await _stage_modification(update, manager_ref.tm, manager_ref.tm.stage_modify_entry, symbol, new_price, is_market)
+        note = "✏️ Entry changed to MARKET." if is_market else f"✏️ Entry changed to {new_price}."
+        await _change(update, symbol, note, None, (), entry=new_price, entry_is_market=is_market)
 
     # ---------- /trail ----------
 
@@ -319,7 +332,7 @@ def build_app(manager_ref):
             await update.message.reply_text(
                 "Usage:\n"
                 "  /trail <SYMBOL> [mult]   \u2014 Set trailing at R \u00d7 mult (default 1R)\n"
-                "  /trail <SYMBOL> off      \u2014 Cancel trailing, restore original SL\n\n"
+                "  /trail <SYMBOL> off      \u2014 Cancel trailing, SL stays where it is\n\n"
                 "Examples:\n"
                 "  /trail BTCUSDT        \u2014 1R trailing\n"
                 "  /trail BTCUSDT 2      \u2014 2R trailing\n"
@@ -366,7 +379,7 @@ def build_app(manager_ref):
             "/dca <SYMBOL> [price]    \u2014 Add/remove DCA order\n"
             "/entry <SYMBOL> <price>  \u2014 Modify entry (pending only)\n"
             "/trail <SYMBOL> [mult]   \u2014 Set trailing stop (default 1R)\n"
-            "/trail <SYMBOL> off      \u2014 Cancel trailing, restore SL\n\n"
+            "/trail <SYMBOL> off      \u2014 Cancel trailing (SL stays put)\n\n"
             "/status [SYMBOL]         \u2014 Show positions & P&L\n"
             "/close <SYMBOL|all>      \u2014 Close position(s)\n"
             "/help                    \u2014 This message"

@@ -285,14 +285,21 @@ def _log_exchange_diagnostics(exchange: BitunixClient, notify):
 def _start_watchdog(exchange: BitunixClient, trade_manager: TradeManager, notify):
     """Background thread: re-checks every trade against Bitunix and revives a dead WebSocket."""
     ws_down_since = [None]
+    last_down_notice = [0.0]
     restarting = threading.Event()
 
     def restart_ws():
         try:
             log.warning("Restarting Bitunix private WebSocket...")
-            exchange.restart_private_ws()
-            log.info("Bitunix private WebSocket restarted")
-            notify("🔌 Bitunix connection restored. Positions re-checked.")
+            exchange.restart_private_ws()  # waits up to 30s for the login
+            if exchange.ws_is_healthy():
+                log.info("Bitunix private WebSocket restarted")
+                if last_down_notice[0]:
+                    notify("🔌 Bitunix connection restored. Positions re-checked.")
+                    last_down_notice[0] = 0.0
+            else:
+                log.warning("Bitunix private WebSocket restarted but not logged in yet (%s)",
+                            exchange.ws_login_error or "no login reply")
             trade_manager.ensure_protection()
         except Exception as e:
             log.error("WebSocket restart failed: %s", e)
@@ -309,8 +316,14 @@ def _start_watchdog(exchange: BitunixClient, trade_manager: TradeManager, notify
                     ws_down_since[0] = time.time()
                     log.warning("Bitunix private WebSocket is down")
                 elif time.time() - ws_down_since[0] > 60 and not restarting.is_set():
-                    notify("⚠️ Bitunix live connection was down >60s — fills may have been missed. Reconnecting; "
-                           "watchdog keeps checking SLs meanwhile.")
+                    # Reconnect every minute, but alert at most every 10 min.
+                    if time.time() - last_down_notice[0] > 600:
+                        reason = (f"\nBitunix rejected the login: {exchange.ws_login_error}\n"
+                                  f"Check the API key and the device clock."
+                                  if exchange.ws_login_error else "")
+                        notify("⚠️ Bitunix live connection was down >60s — fills may have been missed. "
+                               "Reconnecting; watchdog keeps checking SLs meanwhile." + reason)
+                        last_down_notice[0] = time.time()
                     ws_down_since[0] = time.time()
                     restarting.set()
                     threading.Thread(target=restart_ws, daemon=True, name="ws-restart").start()
