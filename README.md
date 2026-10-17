@@ -64,7 +64,20 @@ applied automatically on startup — there is nothing to migrate by hand.
 
 ### Update notes (newest first)
 
-- **Default risk 2%, trailing and editing fixes** (this update).
+- **Leverage picked by price** (this update). No need to type `100x` any more.
+  - With no `5x` in `/place`, leverage comes from the entry price: 10,000+ →
+    100x, 1,000+ → 50x, 100+ → 25x, 1+ → 20x, below 1 → 10x. Bitunix's
+    maximum for the coin still applies, and the card shows what was picked
+    and why. A leverage you type still wins.
+  - In isolated margin only, the automatic leverage is lowered when the SL is
+    so far away that liquidation could come first.
+  - `DEFAULT_LEVERAGE` is no longer used. Delete it from `.env` (startup
+    warns while it's there). To change the tiers, set `LEVERAGE_TIERS` —
+    see `.env.example`.
+    ```bash
+    sed -i '/^DEFAULT_LEVERAGE=/d' .env
+    ```
+- **Default risk 2%, trailing and editing fixes** (`ae2b237`).
   - The default `RISK_PERCENT` is now **2%**, but your `.env` overrides it.
     Check yours with `grep RISK_PERCENT .env`. To use 2%:
     ```bash

@@ -10,7 +10,7 @@ class ParsedSignal:
     entry_is_market: bool = False
     entry_range: Optional[List[float]] = None
     dca: Optional[float] = None
-    leverage: int = 10
+    leverage: Optional[int] = None           # None: picked from LEVERAGE_TIERS by price
     leverage_mode: Optional[str] = None      # "Cross" / "Isolated" / None
     sl: Optional[float] = None
     margin_percent: Optional[float] = None

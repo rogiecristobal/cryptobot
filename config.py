@@ -35,9 +35,36 @@ DCA_SPLIT_RATIO = float(os.getenv("DCA_SPLIT_RATIO", "0.5"))
 if not 0 <= DCA_SPLIT_RATIO <= 1:
     raise RuntimeError(f"DCA_SPLIT_RATIO must be between 0 and 1, got {DCA_SPLIT_RATIO}")
 
-DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "10"))
-if not 1 <= DEFAULT_LEVERAGE <= 100:
-    raise RuntimeError(f"DEFAULT_LEVERAGE must be 1-100, got {DEFAULT_LEVERAGE}")
+# Leverage used when /place doesn't give one (like 5x), picked by entry price.
+# "min_price:leverage" pairs: the highest min_price at or below the price wins.
+# Bitunix's own maximum for the coin still applies on top.
+LEVERAGE_TIERS_RAW = os.getenv("LEVERAGE_TIERS", "10000:100,1000:50,100:25,10:20,1:20,0:10")
+
+
+def _parse_leverage_tiers(raw: str) -> list[tuple[float, int]]:
+    tiers = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            price, lev = part.split(":")
+            tiers.append((float(price), int(lev)))
+        except ValueError:
+            raise RuntimeError(f"LEVERAGE_TIERS entry '{part}' must look like 1000:50 (min price:leverage)")
+    if not tiers or min(p for p, _ in tiers) > 0:
+        raise RuntimeError(f"LEVERAGE_TIERS needs a tier starting at 0 so every price is covered, got '{raw}'")
+    for price, lev in tiers:
+        if not 1 <= lev <= 200:
+            raise RuntimeError(f"LEVERAGE_TIERS leverage must be 1-200, got {lev} for price {price:g}")
+    return sorted(tiers, reverse=True)
+
+
+LEVERAGE_TIERS = _parse_leverage_tiers(LEVERAGE_TIERS_RAW)
+
+
+def leverage_for_price(price: float) -> int:
+    return next(lev for min_price, lev in LEVERAGE_TIERS if price >= min_price)
 
 DEFAULT_MARGIN_MODE = os.getenv("DEFAULT_MARGIN_MODE", "CROSS").upper()
 if DEFAULT_MARGIN_MODE not in ("ISOLATED", "CROSS"):

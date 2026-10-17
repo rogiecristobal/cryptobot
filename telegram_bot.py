@@ -147,7 +147,7 @@ def build_app(manager_ref):
         tps: List[float] = []
         dca = None
         risk_pct = None
-        leverage = config.DEFAULT_LEVERAGE
+        leverage = None  # not given: picked from LEVERAGE_TIERS by price
         trailing_mult = None
 
         rest = args[3:]
@@ -191,7 +191,7 @@ def build_app(manager_ref):
                     risk_pct = val
             elif token.lower().endswith("x"):
                 lev = _parse_leverage(token)
-                if lev is None:
+                if lev is None or lev < 1:
                     await update.message.reply_text(f"Invalid leverage: {token}")
                     return
                 leverage = lev
@@ -373,6 +373,7 @@ def build_app(manager_ref):
             "🤖 CryptoBot Commands\n\n"
             "/place <ASSET> LONG|SHORT <ENTRY|market> SL <SL> [options]\n"
             "  Options: TP <p1> [p2 p3] DCA <price> RISK <%> LEVERAGEx\n"
+            "  Leverage is picked by price if you leave it out (BTC 100x ... under $1 10x)\n"
             "  Example: /place BTC LONG market SL 67000 TP 71000 RISK 3 5x\n\n"
             "/sl <SYMBOL> <price>     \u2014 Modify stop loss\n"
             "/tp <SYMBOL> <p1> [p2 p3] \u2014 Set TPs (last one closes; earlier ones move SL)\n"

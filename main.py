@@ -252,9 +252,13 @@ def _log_startup_diagnostics():
     log.info("Libraries: python-telegram-bot=%s requests=%s websocket-client=%s certifi=%s",
              ver("python-telegram-bot"), ver("requests"), ver("websocket-client"), ver("certifi"))
     log.info("CWD=%s  DB=%s", os.getcwd(), config.DB_PATH)
-    log.info("Config: exchange=Bitunix risk=%s%% max_risk=%s%% dca_split=%s leverage=%s margin=%s "
+    if os.getenv("DEFAULT_LEVERAGE"):
+        log.warning("DEFAULT_LEVERAGE in .env is no longer used — leverage comes from LEVERAGE_TIERS. "
+                    "Delete the line to silence this.")
+    log.info("Config: exchange=Bitunix risk=%s%% max_risk=%s%% dca_split=%s leverage_tiers=%s margin=%s "
              "confirm_timeout=%ss breakeven_timeout=%ss watchdog=%ss trailing=%ss",
-             config.RISK_PERCENT, config.MAX_RISK_PERCENT, config.DCA_SPLIT_RATIO, config.DEFAULT_LEVERAGE,
+             config.RISK_PERCENT, config.MAX_RISK_PERCENT, config.DCA_SPLIT_RATIO,
+             ",".join(f"{p:g}:{lev}" for p, lev in config.LEVERAGE_TIERS),
              config.DEFAULT_MARGIN_MODE, config.CONFIRM_TIMEOUT_SECONDS, config.BREAKEVEN_TIMEOUT_SECONDS,
              config.WATCHDOG_INTERVAL_SECONDS, config.TRAILING_INTERVAL_SECONDS)
     log.info("System clock: %s (epoch %.0f) — Bitunix rejects requests if this drifts", time.strftime("%Y-%m-%d %H:%M:%S %z"), time.time())

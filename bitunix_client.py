@@ -253,7 +253,8 @@ class BitunixClient:
             raise ValueError(f"{symbol} does not support API trading on Bitunix.")
 
     def get_max_leverage(self, symbol: str) -> int:
-        return int(_f(self.get_instrument_info(symbol).get("maxLeverage")) or config.DEFAULT_LEVERAGE)
+        """Bitunix's maximum leverage for the symbol, or 0 if it doesn't say."""
+        return int(_f(self.get_instrument_info(symbol).get("maxLeverage")))
 
     def _qty_decimals(self, symbol: str) -> int:
         return int(self.get_instrument_info(symbol).get("basePrecision") or 0)

@@ -207,12 +207,15 @@ class TradeManager:
                 f"Rejected: this trade would risk ${actual_risk:,.2f} ({actual_pct:.2f}% of ${equity:,.2f}), "
                 f"above MAX_RISK_PERCENT {config.MAX_RISK_PERCENT}%.{min_size_note}")
 
+        ref_price = signal.entry if not signal.entry_is_market else (mark or self.exchange.get_last_price(symbol))
+        leverage, leverage_why = self._pick_leverage(signal, ref_price)
+
         token = self._new_token()
         with self._lock:
             self.pending[symbol] = {
                 "signal": signal, "expiry": expiry, "token": token,
                 "chat_id": None, "message_id": None,
-                "cached_qty": sizing,
+                "cached_qty": sizing, "leverage": leverage,
             }
 
         trailing_desc = ""
@@ -238,8 +241,39 @@ class TradeManager:
             lines.append(f"TPs: {', '.join(str(t) for t in signal.tps)}")
             if len(signal.tps) > 1:
                 lines.append(self._tp_plan_text(len(signal.tps)).strip())
-        lines.append(f"Leverage: {signal.leverage}x ({signal.leverage_mode or config.DEFAULT_MARGIN_MODE}){trailing_desc}")
+        lines.append(f"Leverage: {leverage}x {self._margin_mode(signal)} — {leverage_why}{trailing_desc}")
         return "\n".join(lines), token
+
+    @staticmethod
+    def _margin_mode(signal: ParsedSignal) -> str:
+        mode = (signal.leverage_mode or config.DEFAULT_MARGIN_MODE).upper()
+        return "ISOLATED" if mode.startswith("ISOLAT") else "CROSS"
+
+    def _pick_leverage(self, signal: ParsedSignal, ref_price: float) -> tuple[int, str]:
+        """
+        Leverage for the trade and why, for the card. A leverage typed in
+        /place wins; otherwise LEVERAGE_TIERS picks it by price. Leverage
+        doesn't change the loss at SL (size comes from the risk %), only the
+        margin used and how far away liquidation is.
+        """
+        if signal.leverage is not None:
+            lev, why = signal.leverage, "as given"
+        else:
+            lev = config.leverage_for_price(ref_price)
+            why = f"auto for price {ref_price:g}"
+            if self._margin_mode(signal) == "ISOLATED" and ref_price > 0:
+                # Isolated liquidation is about 1/leverage away. Keep it at least
+                # twice the SL distance, so the SL fires before liquidation can.
+                sl_distance = abs(ref_price - signal.sl) / ref_price
+                cap = max(1, int(1 / (2 * sl_distance)))
+                if cap < lev:
+                    why = f"auto {lev}x lowered so isolated liquidation stays well past the SL"
+                    lev = cap
+        max_lev = self.exchange.get_max_leverage(signal.asset)
+        if max_lev and lev > max_lev:
+            why += f", Bitunix max is {max_lev}x"
+            lev = max_lev
+        return lev, why
 
     @staticmethod
     def _validate_levels(signal: ParsedSignal):
@@ -328,9 +362,8 @@ class TradeManager:
         qty_entry, qty_dca, risk_amount, *_ = entry.get("cached_qty") or self._calc_qty(signal)
         side = "BUY" if signal.position == "LONG" else "SELL"
 
-        max_lev = self.exchange.get_max_leverage(symbol)
-        leverage = min(signal.leverage, max_lev)
-        self.exchange.set_margin_mode(symbol, signal.leverage_mode or config.DEFAULT_MARGIN_MODE)
+        leverage = entry["leverage"]  # chosen when staged, as shown on the card
+        self.exchange.set_margin_mode(symbol, self._margin_mode(signal))
         self.exchange.set_leverage(symbol, leverage)
 
         trailing_distance = None
