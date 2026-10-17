@@ -4,8 +4,11 @@ this is the single most important security boundary in the whole bot.
 """
 import asyncio
 import logging
+import platform
+import time
 from typing import Optional, List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from signal_parser import ParsedSignal
 import config
@@ -30,11 +33,13 @@ _LABELS = {"sl", "tp", "dca", "risk", "trail"}
 async def _stage_signal(update: Update, trade_manager, signal: ParsedSignal):
     """Stage a pre-built ParsedSignal and reply with the confirmation card."""
     try:
-        prompt = await asyncio.to_thread(trade_manager.stage_signal, signal)
+        prompt, token = await asyncio.to_thread(trade_manager.stage_signal, signal)
+        # The token ties the buttons to this exact trade: a newer card for the
+        # same symbol replaces it, and this card's buttons then do nothing.
         keyboard = [
             [
-                InlineKeyboardButton("✅ Confirm", callback_data=f"confirm:{signal.asset}"),
-                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{signal.asset}"),
+                InlineKeyboardButton("✅ Confirm", callback_data=f"confirm:{signal.asset}:{token}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{signal.asset}:{token}"),
             ]
         ]
         sent_msg = await update.message.reply_text(prompt, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -49,12 +54,12 @@ async def _stage_signal(update: Update, trade_manager, signal: ParsedSignal):
 async def _stage_modification(update: Update, trade_manager, mod_func, *args):
     """Generic helper to stage any modification command and reply with a confirmation card."""
     try:
-        prompt = await asyncio.to_thread(mod_func, *args)
+        prompt, token = await asyncio.to_thread(mod_func, *args)
         symbol = args[0]
         keyboard = [
             [
-                InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_mod:{symbol}"),
-                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_mod:{symbol}"),
+                InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_mod:{symbol}:{token}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_mod:{symbol}:{token}"),
             ]
         ]
         sent_msg = await update.message.reply_text(prompt, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -206,7 +211,7 @@ def build_app(manager_ref):
                     await update.message.reply_text(f"For LONG, DCA {dca} must be below entry {entry}.")
                     return
                 if direction == "SHORT" and dca <= entry:
-                    await update.message.reply_text(f"For SHORT, DCA {dca} must be below entry {entry}.")
+                    await update.message.reply_text(f"For SHORT, DCA {dca} must be above entry {entry}.")
                     return
 
         signal = ParsedSignal(
@@ -402,7 +407,7 @@ def build_app(manager_ref):
                 return
             keyboard = [
                 [InlineKeyboardButton("⚠️ Close all", callback_data="close_all:all")],
-                [InlineKeyboardButton("Cancel", callback_data="cancel:all")],
+                [InlineKeyboardButton("Cancel", callback_data="close_cancel:all")],
             ]
             await update.message.reply_text(
                 f"Close ALL {len(symbols)} active positions?",
@@ -421,7 +426,7 @@ def build_app(manager_ref):
         keyboard = [
             [
                 InlineKeyboardButton("✅ Close", callback_data=f"close:{symbol}"),
-                InlineKeyboardButton("Cancel", callback_data=f"cancel:{symbol}"),
+                InlineKeyboardButton("Cancel", callback_data=f"close_cancel:{symbol}"),
             ]
         ]
         await update.message.reply_text(
@@ -436,14 +441,16 @@ def build_app(manager_ref):
             return
         query = update.callback_query
         await query.answer()
-        action, symbol = query.data.split(":", 1)
+        # action:symbol[:token] — cards from before tokens existed have none and count as outdated.
+        action, symbol, *rest = query.data.split(":")
+        token = rest[0] if rest else None
         trade_manager = manager_ref.tm
         chat_id = query.message.chat_id
         message_id = query.message.message_id
 
         if action == "confirm":
             try:
-                result = await asyncio.to_thread(trade_manager.confirm, symbol)
+                result = await asyncio.to_thread(trade_manager.confirm, symbol, token)
                 await context.bot.edit_message_text(
                     chat_id=chat_id, message_id=message_id,
                     text=result,
@@ -455,19 +462,19 @@ def build_app(manager_ref):
                     text=f"⚠️ Error placing the trade for {symbol}: {e}",
                 )
         elif action == "cancel":
-            result = trade_manager.cancel(symbol)
+            result = trade_manager.cancel(symbol, token)
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=message_id,
                 text=result,
             )
         elif action == "confirm_mod":
-            result = await asyncio.to_thread(trade_manager.apply_modification, symbol)
+            result = await asyncio.to_thread(trade_manager.apply_modification, symbol, token)
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=message_id,
                 text=result,
             )
         elif action == "cancel_mod":
-            result = trade_manager.cancel_modification(symbol)
+            result = trade_manager.cancel_modification(symbol, token)
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=message_id,
                 text=result,
@@ -499,6 +506,44 @@ def build_app(manager_ref):
                 chat_id=chat_id, message_id=message_id,
                 text="\n".join(messages),
             )
+        elif action == "close_cancel":
+            # Only edits the card: a pending trade for the same symbol is left alone.
+            text = "Close cancelled." if symbol == "all" else f"Close cancelled — {symbol} stays open."
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+
+    # ---------- Errors ----------
+
+    last_conflict_alert = [0.0]
+
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+        err = context.error
+        if isinstance(err, Conflict):
+            # Another process is polling with this token. Both copies manage the
+            # same Bitunix account with their own state and fight over SLs.
+            log.error("Telegram polling conflict — another copy of the bot is running: %s", err)
+            if time.time() - last_conflict_alert[0] > 600:
+                last_conflict_alert[0] = time.time()
+                try:
+                    await context.bot.send_message(
+                        chat_id=config.TELEGRAM_CHAT_ID,
+                        text=(f"⚠️ Another copy of this bot is running with the same token "
+                              f"(this one: {platform.node()}). Both manage the same Bitunix "
+                              f"positions and will overwrite each other's SLs. Stop one of them."))
+                except Exception as e:
+                    log.warning("Could not send the conflict alert: %s", e)
+            return
+        if not isinstance(update, Update):
+            # Polling/network errors: PTB retries on its own.
+            log.warning("Telegram error: %s", err)
+            return
+        log.error("Unhandled error in Telegram handler", exc_info=err)
+        # Tell the user, so a failed button press doesn't look like nothing happened.
+        if update.effective_chat and update.effective_chat.id == config.TELEGRAM_CHAT_ID:
+            try:
+                await context.bot.send_message(chat_id=config.TELEGRAM_CHAT_ID,
+                                               text=f"⚠️ Something went wrong: {err}\nCheck Bitunix and /status.")
+            except Exception:
+                pass
 
     # ---------- Register handlers ----------
 
@@ -512,4 +557,5 @@ def build_app(manager_ref):
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("close", close_command))
     app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_error_handler(error_handler)
     return app

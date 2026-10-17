@@ -41,37 +41,54 @@ python3 main.py
 ## Updating on Termux
 
 `git pull` updates the code, but **not `.env`**: it is gitignored, so any
-setting change has to be made by hand on the phone. Check the update notes
-below for anything that needs doing.
+setting change has to be made by hand on the phone. The update notes below
+say what each update needs.
 
 ```bash
 # 1. Note your open trades first: send /status to the bot in Telegram.
 # 2. Stop the running bot (Ctrl+C). Two copies polling Telegram at once fail
 #    with "Conflict: terminated by other getUpdates request".
 cd ~/cryptobot            # wherever you cloned it
+git log --oneline -1      # the version you're on now — note the 7-character id
 git pull
 pip install -r requirements.txt --break-system-packages   # only if requirements.txt changed
-# 3. Apply any .env changes from the update notes below
+# 3. Apply the update notes below for every update NEWER than the id you noted
 # 4. Start it again
 python3 main.py
 # 5. Check the "reconciled" messages in Telegram, or send /status
 ```
 
 Open trades survive the restart: on startup `reconcile()` re-checks every
-trade against Bitunix and re-applies its SL and TPs. Database changes are
+trade against Bitunix and re-applies its SL and TP. Database changes are
 applied automatically on startup — there is nothing to migrate by hand.
 
 ### Update notes (newest first)
 
-- **TPs move the SL instead of taking profit** (this update). No `.env` change.
+- **Safety fixes** (this update). Optional `.env` addition:
+  `MAX_RISK_PERCENT=5.0` (the default if missing) — no trade can risk more.
+  - Only **one copy** of the bot can run. A second copy on the same device
+    stops at once; one on another device stops after a ~10s check at startup
+    and says so in Telegram. Startup is ~10s slower because of that check.
+  - Confirmation cards from before this update no longer work — send the
+    command again.
+  - The trade card now shows the risk of the size **actually ordered**.
+    Sizes are rounded down, never up. If Bitunix's minimum order size pushes
+    a trade above `MAX_RISK_PERCENT`, it is rejected.
+  - A failed close is no longer reported as closed: the bot keeps tracking
+    the trade and retries every 30s.
+
+- **TPs move the SL instead of taking profit** (`42d7886`). No `.env` change.
   - Only the **last** TP closes the position; earlier TPs only move the SL.
-  - Open trades from `2b8f590` (which split the position across TPs) have
-    their partial TP orders **cancelled on the first restart**, so nothing
-    closes before the last TP. Their SL and last TP stay on Bitunix.
+  - If you were on `2b8f590` (which split the position across TPs), open
+    trades have their partial TP orders **cancelled on the first restart**,
+    so nothing closes before the last TP. Their SL and last TP stay on
+    Bitunix. A failed cancel shows a Telegram alert and is retried every 30s.
+  - If you were on an older version, open trades with several TPs saved get
+    only the last TP on Bitunix; the earlier ones become SL checkpoints.
   - Check after the restart: in the Bitunix app each open position should
     show one TP/SL with the last TP — no partial TPs.
-- **Split TPs and SL step-up** (`2b8f590`). Replaced by the update above —
-  skip straight to it.
+- **Split TPs and SL step-up** (`2b8f590`). Replaced by `42d7886` above —
+  nothing to do for it.
 - **Margin mode defaults to cross** (`55edff4`). If your `.env` still has
   `DEFAULT_MARGIN_MODE=ISOLATED`, set it to `CROSS` (or delete the line):
   ```bash
@@ -96,6 +113,11 @@ applied automatically on startup — there is nothing to migrate by hand.
 - If a DCA level is present, position size is split between the entry order
   and the DCA order per `DCA_SPLIT_RATIO` (default 0.5 = 50/50), sized so that
   if *both* fill, your total risk still lands near your target `RISK_PERCENT`.
+- The card shows the risk of the quantities actually ordered. Quantities are
+  rounded down; Bitunix's minimum order size can still push risk above target,
+  and anything above `MAX_RISK_PERCENT` (default 5%) is rejected.
+- Each card's buttons only act on the trade or change that card shows. If a
+  newer card for the same symbol replaced it, they do nothing.
 - **Only the last TP takes profit.** With TPs `71000 72000 73000` (in `/place …
   TP 71000 72000 73000` or `/tp BTC 71000 72000 73000`), TP3 is a real TP on
   Bitunix that closes the whole position. It is attached to every opening

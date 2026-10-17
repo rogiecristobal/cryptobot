@@ -8,6 +8,7 @@ Core trade lifecycle:
 import logging
 import threading
 import time
+import uuid
 from typing import Optional, List
 from signal_parser import ParsedSignal
 from bitunix_client import BitunixClient
@@ -94,6 +95,8 @@ class TradeManager:
             self.sync_protective_orders(symbol)
             return f"⏳ {symbol}: limit entry still waiting to fill — kept."
         else:
+            if state.get("position_opened") and not self.position_gone(symbol):
+                raise RuntimeError("position was briefly missing from Bitunix, then back")
             try:
                 self.exchange.cancel_all(symbol)
             except Exception as e:
@@ -152,7 +155,7 @@ class TradeManager:
 
     # ---------- stage 1: validate + queue for confirmation ----------
 
-    def stage_signal(self, signal: ParsedSignal) -> str:
+    def stage_signal(self, signal: ParsedSignal) -> tuple[str, str]:
         if signal.errors:
             raise ValueError("Signal rejected:\n- " + "\n- ".join(signal.errors))
 
@@ -187,14 +190,27 @@ class TradeManager:
                     if tp >= mark:
                         raise ValueError(f"TP {tp} must be below current MarkPrice {mark} for SHORT.")
 
+        if signal.margin_percent is not None and signal.margin_percent <= 0:
+            raise ValueError(f"RISK must be a positive percentage, got {signal.margin_percent}.")
         expiry = time.time() + config.CONFIRM_TIMEOUT_SECONDS
-        qty_entry, qty_dca, risk_amount, equity, risk_pct = self._calc_qty(signal)
+        sizing = self._calc_qty(signal)
+        qty_entry, qty_dca, risk_amount, equity, risk_pct, actual_risk = sizing
+        if equity <= 0:
+            raise ValueError("Bitunix shows no USDT equity — can't size the trade.")
+        actual_pct = actual_risk / equity * 100
+        min_size_note = (" Bitunix's minimum order size makes it larger than your target."
+                         if actual_risk > risk_amount * 1.01 else "")
+        if actual_pct > config.MAX_RISK_PERCENT:
+            raise ValueError(
+                f"Rejected: this trade would risk ${actual_risk:,.2f} ({actual_pct:.2f}% of ${equity:,.2f}), "
+                f"above MAX_RISK_PERCENT {config.MAX_RISK_PERCENT}%.{min_size_note}")
 
+        token = self._new_token()
         with self._lock:
             self.pending[symbol] = {
-                "signal": signal, "expiry": expiry,
+                "signal": signal, "expiry": expiry, "token": token,
                 "chat_id": None, "message_id": None,
-                "cached_qty": (qty_entry, qty_dca, risk_amount, equity, risk_pct),
+                "cached_qty": sizing,
             }
 
         trailing_desc = ""
@@ -209,15 +225,32 @@ class TradeManager:
         if signal.dca:
             lines.append(f"DCA: {signal.dca}  (qty ~{qty_dca})")
         lines.append(f"SL: {signal.sl}")
-        lines.append(f"Risk: ${risk_amount:.2f} ({risk_pct}% of ${equity:,.2f})")
+        # The risk of the qty actually ordered: rounding and Bitunix's minimum
+        # order size can move it away from the target.
+        lines.append(f"Risk: ${actual_risk:.2f} ({actual_pct:.2f}% of ${equity:,.2f})")
+        if abs(actual_risk - risk_amount) > risk_amount * 0.01:
+            warn = "⚠️ " if min_size_note else ""
+            lines.append(f"  {warn}Target was {risk_pct}% (${risk_amount:.2f}); sizes are rounded to what "
+                         f"Bitunix accepts.{min_size_note}")
         if signal.tps:
             lines.append(f"TPs: {', '.join(str(t) for t in signal.tps)}")
             if len(signal.tps) > 1:
                 lines.append(self._tp_plan_text(len(signal.tps)).strip())
         lines.append(f"Leverage: {signal.leverage}x ({signal.leverage_mode or config.DEFAULT_MARGIN_MODE}){trailing_desc}")
-        return "\n".join(lines)
+        return "\n".join(lines), token
+
+    @staticmethod
+    def _new_token() -> str:
+        """Ties a Telegram card's buttons to the staged trade/modification it shows."""
+        return uuid.uuid4().hex[:8]
+
+    @staticmethod
+    def _stale_card(symbol: str) -> str:
+        return f"⚠️ This card for {symbol} was replaced by a newer one — nothing done. Use the latest card."
 
     def _calc_qty(self, signal: ParsedSignal):
+        """Returns (qty_entry, qty_dca, target_risk, equity, risk_pct, actual_risk),
+        actual_risk being the loss at SL of the rounded quantities."""
         equity = self.exchange.get_equity_usdt()
 
         risk_pct = signal.margin_percent if signal.margin_percent is not None else config.RISK_PERCENT
@@ -233,19 +266,26 @@ class TradeManager:
             avg_entry = entry_price * w_e + signal.dca * w_d
             total_qty = risk_amount / abs(avg_entry - signal.sl)
             qty_entry = self.exchange.round_qty(signal.asset, total_qty * w_e)
-            qty_dca = self.exchange.round_qty(signal.asset, total_qty * w_d)
+            # DCA_SPLIT_RATIO=1 puts everything on the entry: no DCA, rather than a minimum-size one.
+            qty_dca =self.exchange.round_qty(signal.asset, total_qty * w_d) if w_d > 0 else 0.0
         else:
             total_qty = risk_amount / abs(entry_price - signal.sl)
             qty_entry = self.exchange.round_qty(signal.asset, total_qty)
             qty_dca = 0.0
 
-        return qty_entry, qty_dca, risk_amount, equity, risk_pct
+        actual_risk = qty_entry * abs(entry_price - signal.sl)
+        if qty_dca:
+            actual_risk += qty_dca * abs(signal.dca - signal.sl)
+        return qty_entry, qty_dca, risk_amount, equity, risk_pct, actual_risk
 
     # ---------- stage 2: confirmed -> place entry/DCA + SL/TP ----------
 
-    def confirm(self, symbol: str) -> str:
+    def confirm(self, symbol: str, token: Optional[str]) -> str:
         with self._lock:
-            entry = self.pending.pop(symbol, None)
+            entry = self.pending.get(symbol)
+            if entry and entry.get("token") != token:
+                return self._stale_card(symbol)
+            self.pending.pop(symbol, None)
         if not entry:
             return f"No pending confirmation for {symbol} (expired or never staged)."
         signal = entry["signal"]
@@ -351,8 +391,13 @@ class TradeManager:
         else:
             self.db.delete(symbol)
 
-    def cancel(self, symbol: str) -> str:
+    def cancel(self, symbol: str, token: Optional[str]) -> str:
         with self._lock:
+            entry = self.pending.get(symbol)
+            if not entry:
+                return f"Nothing pending for {symbol} (expired or already handled)."
+            if entry.get("token") != token:
+                return self._stale_card(symbol)
             self.pending.pop(symbol, None)
         return f"Trade for {symbol} cancelled."
 
@@ -722,23 +767,50 @@ class TradeManager:
             return "TP"
         return "Trailing SL" if trailing else "SL"
 
-    def handle_sl_fill(self, symbol: str, source: str = "SL"):
+    def position_gone(self, symbol: str, checks: int = 2, delay: float = 1.0) -> bool:
+        """
+        Confirm a "position closed" reading (a size-0 push, an empty REST
+        answer) before acting on it: True only if Bitunix shows no position on
+        `checks` more reads, `delay`s apart. handle_sl_fill() market-closes
+        whatever is open, so acting on a false reading would close a live trade.
+        """
+        for _ in range(checks):
+            time.sleep(delay)
+            if self.exchange.get_open_position(symbol):
+                return False
+        return True
+
+    def handle_sl_fill(self, symbol: str, source: str = "SL") -> bool:
+        """
+        Close the trade out: cancel its orders, market-close any residual, then
+        forget it. If that fails the trade stays tracked with close_reason set,
+        and the watchdog retries the close. Returns True once the trade is
+        closed (or another thread is already closing it).
+        """
         with self._lock:
             state = self.db.get(symbol)
-            if not state:
-                return
-            self.db.delete(symbol)
+            if not state or state["status"] == "closing":
+                return True
+            # 'closing' hides the trade from every other handler and loop meanwhile.
+            self.db.upsert(symbol, status="closing", close_reason=source)
 
         try:
             self.exchange.cancel_all(symbol)
             qty = self.exchange.close_position_market(symbol)
-            if qty > 0:
-                self.notify(f"🛑 {source} triggered on {symbol} — residual detected, force-closed {qty}.")
         except Exception as e:
             log.error("Force-close failed for %s: %s", symbol, e)
-            self.notify(f"⚠️ {source} on {symbol} — force-close failed: {e}")
-        finally:
-            self.notify(f"🛑 {source} triggered on {symbol} — position closed.")
+            self.db.upsert(symbol, status="active")
+            self._alert(f"close_fail:{symbol}",
+                        f"⚠️ {source} on {symbol} — closing FAILED: {e}\n"
+                        f"The bot is still tracking it and retries every {config.WATCHDOG_INTERVAL_SECONDS}s. "
+                        f"Check Bitunix.")
+            return False
+
+        self.db.delete(symbol)
+        if qty > 0:
+            self.notify(f"🛑 {source} triggered on {symbol} — residual detected, force-closed {qty}.")
+        self.notify(f"🛑 {source} triggered on {symbol} — position closed.")
+        return True
 
     def handle_entry_or_dca_fill(self, symbol: str):
         state = self.db.get(symbol)
@@ -802,6 +874,10 @@ class TradeManager:
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
             return
+        if state.get("close_reason"):
+            log.warning("Watchdog: retrying the close of %s (%s)", symbol, state["close_reason"])
+            self.handle_sl_fill(symbol, state["close_reason"])
+            return
         pos = self.exchange.get_open_position(symbol)
 
         if pos:
@@ -817,6 +893,9 @@ class TradeManager:
             return
 
         if state.get("position_opened"):
+            if not self.position_gone(symbol):
+                log.warning("Watchdog: %s position briefly missing from Bitunix, then back — ignored", symbol)
+                return
             log.warning("Watchdog: %s position is gone but the close event was missed — cleaning up", symbol)
             self.handle_sl_fill(symbol, "Position closed")
             return
@@ -890,7 +969,7 @@ class TradeManager:
             return f"Trailing cancelled for {symbol}. SL restored to {original_sl}."
         return f"Trailing cancelled for {symbol}."
 
-    def stage_modify_trail(self, symbol: str, mult: float) -> str:
+    def stage_modify_trail(self, symbol: str, mult: float) -> tuple[str, str]:
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
             raise ValueError(f"No active position for {symbol}.")
@@ -911,22 +990,24 @@ class TradeManager:
             f"  Multiplier: {mult}R\n"
             f"  Distance: ${td:,.0f} retracement from peak"
         )
-        with self._lock:
-            self.pending_mods[symbol] = {
-                "type": "trail",
-                "params": {"distance": td, "r_mult": mult},
-                "chat_id": None, "message_id": None,
-            }
-        return prompt
+        return prompt, self._stage_mod(symbol, "trail", {"distance": td, "r_mult": mult})
 
     # ---------- modification commands (sl, tp, dca, entry) ----------
+
+    def _stage_mod(self, symbol: str, mod_type: str, params: dict) -> str:
+        """Queue a modification for confirmation. Returns the token its card's buttons carry."""
+        token = self._new_token()
+        with self._lock:
+            self.pending_mods[symbol] = {"type": mod_type, "params": params, "token": token,
+                                         "chat_id": None, "message_id": None}
+        return token
 
     def _dca_qty_from_state(self, state: dict, dca_price: float) -> tuple[float, float, float]:
         """
         Size a DCA from the risk budget the entry hasn't used yet, so that
         entry + DCA both hitting SL loses about the trade's original risk.
-        Returns (qty, remaining_risk, risk_amount); raises ValueError with a
-        user-facing reason when a DCA can't be sized safely.
+        Returns (qty, remaining_risk, risk_amount, dca_risk); raises ValueError
+        with a user-facing reason when a DCA can't be sized safely.
         """
         symbol = state["symbol"]
         sl = state.get("sl_price") or 0
@@ -959,17 +1040,21 @@ class TradeManager:
                 f"a DCA would exceed your risk. Not placed."
             )
         qty = self.exchange.round_qty(symbol, remaining / abs(dca_price - sl))
-        return qty, remaining, risk_amount
+        dca_risk = qty * abs(dca_price - sl)
+        if dca_risk > remaining * 1.01:
+            raise ValueError(
+                f"Bitunix's minimum order size ({qty}) makes this DCA risk ${dca_risk:,.2f}, more than the "
+                f"${remaining:,.2f} left in the ${risk_amount:,.2f} budget. Not placed."
+            )
+        return qty, remaining, risk_amount, dca_risk
 
-    def stage_modify_sl(self, symbol: str, new_sl: float) -> str:
+    def stage_modify_sl(self, symbol: str, new_sl: float) -> tuple[str, str]:
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
             if symbol in self.pending:
                 signal = self.pending[symbol]["signal"]
                 prompt = f"Modify SL for {symbol}?\n  Current: {signal.sl}\n  New: {new_sl}"
-                with self._lock:
-                    self.pending_mods[symbol] = {"type": "sl", "params": {"new_price": new_sl}, "chat_id": None, "message_id": None}
-                return prompt
+                return prompt, self._stage_mod(symbol, "sl", {"new_price": new_sl})
             raise ValueError(f"No active position or pending trade for {symbol}.")
 
         if new_sl <= 0:
@@ -986,9 +1071,7 @@ class TradeManager:
 
         old_sl = state["sl_price"]
         prompt = f"Modify SL for {symbol}?\n  Current: {old_sl}\n  New: {new_sl}"
-        with self._lock:
-            self.pending_mods[symbol] = {"type": "sl", "params": {"new_price": new_sl}, "chat_id": None, "message_id": None}
-        return prompt
+        return prompt, self._stage_mod(symbol, "sl", {"new_price": new_sl})
 
     def _validate_tps(self, symbol: str, position: str, prices: List[float]):
         """Bitunix rejects a TP on the wrong side of mark — catch it before the user confirms."""
@@ -1011,7 +1094,7 @@ class TradeManager:
         return (f"  The first {n - 1} TPs only move the SL: to entry at the first, then to the previous TP.\n"
                 f"  Nothing is closed until the last TP (or the SL).")
 
-    def stage_modify_tp(self, symbol: str, new_prices: List[float]) -> str:
+    def stage_modify_tp(self, symbol: str, new_prices: List[float]) -> tuple[str, str]:
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
             if symbol in self.pending:
@@ -1021,9 +1104,7 @@ class TradeManager:
                 old = ", ".join(str(t) for t in signal.tps) or "none"
                 prompt = (f"Modify TPs for {symbol}?\n  Current: {old}\n"
                           f"  New: {', '.join(str(t) for t in new_prices)}\n{self._tp_plan_text(len(new_prices))}")
-                with self._lock:
-                    self.pending_mods[symbol] = {"type": "tp", "params": {"new_prices": new_prices}, "chat_id": None, "message_id": None}
-                return prompt
+                return prompt, self._stage_mod(symbol, "tp", {"new_prices": new_prices})
             raise ValueError(f"No active position or pending trade for {symbol}.")
 
         self._validate_tps(symbol, state["position"], new_prices)
@@ -1034,11 +1115,9 @@ class TradeManager:
         if hit:
             prompt += f"\n  Already hit (kept): {', '.join(str(t) for t in hit)}"
         prompt += "\n" + self._tp_plan_text(len(new_prices))
-        with self._lock:
-            self.pending_mods[symbol] = {"type": "tp", "params": {"new_prices": new_prices}, "chat_id": None, "message_id": None}
-        return prompt
+        return prompt, self._stage_mod(symbol, "tp", {"new_prices": new_prices})
 
-    def stage_modify_dca(self, symbol: str, dca_price: Optional[float]) -> str:
+    def stage_modify_dca(self, symbol: str, dca_price: Optional[float]) -> tuple[str, str]:
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
             if symbol in self.pending:
@@ -1047,30 +1126,30 @@ class TradeManager:
                     prompt = f"Remove DCA for {symbol}?"
                 else:
                     prompt = f"Add DCA for {symbol}?\n  Price: {dca_price}"
-                with self._lock:
-                    self.pending_mods[symbol] = {"type": "dca", "params": {"new_price": dca_price}, "chat_id": None, "message_id": None}
-                return prompt
+                return prompt, self._stage_mod(symbol, "dca", {"new_price": dca_price})
             raise ValueError(f"No active position or pending trade for {symbol}.")
 
         if dca_price is None:
             prompt = f"Remove DCA for {symbol}?"
         else:
-            qty, remaining, risk_amount = self._dca_qty_from_state(state, dca_price)
+            qty, remaining, risk_amount, dca_risk = self._dca_qty_from_state(state, dca_price)
             prompt = (f"Modify DCA for {symbol}?\n  Price: {dca_price}  (qty ~{qty})\n"
-                      f"  Uses remaining risk ${remaining:,.2f} of ${risk_amount:,.2f}")
-        with self._lock:
-            self.pending_mods[symbol] = {"type": "dca", "params": {"new_price": dca_price}, "chat_id": None, "message_id": None}
-        return prompt
+                      f"  Risks ${dca_risk:,.2f} of the ${remaining:,.2f} left in the ${risk_amount:,.2f} budget")
+        return prompt, self._stage_mod(symbol, "dca", {"new_price": dca_price})
 
-    def stage_modify_entry(self, symbol: str, new_price: Optional[float], is_market: bool) -> str:
+    def stage_modify_entry(self, symbol: str, new_price: Optional[float], is_market: bool) -> tuple[str, str]:
         if symbol in self.pending:
             entry_desc = "MARKET" if is_market else new_price
-            return f"Modify Entry for {symbol}?\n  New: {entry_desc}"
+            prompt = f"Modify Entry for {symbol}?\n  New: {entry_desc}"
+            return prompt, self._stage_mod(symbol, "entry", {"new_price": new_price, "is_market": is_market})
         raise ValueError(f"No pending trade for {symbol} — entry can only be modified before confirmation.")
 
-    def apply_modification(self, symbol: str) -> str:
+    def apply_modification(self, symbol: str, token: Optional[str]) -> str:
         with self._lock:
-            mod = self.pending_mods.pop(symbol, None)
+            mod = self.pending_mods.get(symbol)
+            if mod and mod.get("token") != token:
+                return self._stale_card(symbol)
+            self.pending_mods.pop(symbol, None)
         if not mod:
             return f"No pending modification for {symbol}."
 
@@ -1085,6 +1164,9 @@ class TradeManager:
             if pend and mod_type == "tp":
                 return (f"✅ TPs for pending {symbol} set to {', '.join(str(t) for t in params['new_prices'])} "
                         f"— tap Confirm on the trade card to place them.")
+            if pend:
+                return (f"⚠️ Changing the {mod_type.upper()} of an unconfirmed trade isn't supported yet — "
+                        f"nothing changed. Cancel the trade card and send /place again.")
             return f"No active position for {symbol}."
 
         if mod_type == "sl":
@@ -1121,25 +1203,45 @@ class TradeManager:
 
         elif mod_type == "dca":
             new_price = params["new_price"]
-            dca_qty = 0.0
             if new_price is not None:
-                # Size before cancelling anything, so a rejected DCA leaves the old one intact
+                # Validate before cancelling anything, so a rejected DCA leaves the old one intact
                 try:
-                    dca_qty, *_ = self._dca_qty_from_state(state, new_price)
+                    self._dca_qty_from_state(state, new_price)
                 except ValueError as e:
                     return f"❌ DCA not changed: {e}"
-            if state.get("dca_order_id"):
-                self.exchange.cancel_order(symbol, state["dca_order_id"])
+            old_id = state.get("dca_order_id")
+            if old_id:
+                # cancel_order() only logs failures. Check the old DCA really is gone:
+                # placing the new one next to it would double the DCA and the risk.
+                self.exchange.cancel_order(symbol, old_id)
+                try:
+                    still_open = any(o["order_id"] == old_id for o in self.exchange.get_open_orders(symbol))
+                except Exception as e:
+                    return (f"❌ Could not confirm the old DCA order {old_id} was cancelled ({e}). "
+                            f"New DCA NOT placed — check Bitunix and retry.")
+                if still_open:
+                    return (f"❌ Bitunix did not cancel the old DCA order {old_id}. "
+                            f"New DCA NOT placed, so you can't end up with two — check Bitunix and retry.")
             self.db.upsert(symbol, dca_order_id=None, dca_price=None)
-            if new_price is not None and dca_qty > 0:
-                side = "BUY" if state["position"] == "LONG" else "SELL"
-                dca_price = self.exchange.round_price(symbol, new_price)
+            if new_price is None:
+                return f"✅ DCA removed for {symbol}."
+            # Size again now the old DCA is gone: if it filled meanwhile, the position grew.
+            state = self.db.get(symbol)
+            try:
+                dca_qty, *_ = self._dca_qty_from_state(state, new_price)
+            except ValueError as e:
+                return f"⚠️ Old DCA removed, but the new one was NOT placed: {e}"
+            side = "BUY" if state["position"] == "LONG" else "SELL"
+            dca_price = self.exchange.round_price(symbol, new_price)
+            try:
                 dca_order = self.exchange.place_limit_order(symbol, side, dca_qty, dca_price,
                                                          stop_loss=state["sl_price"],
                                                          take_profit=self._target_tp(symbol, state))
-                self.db.upsert(symbol, dca_order_id=dca_order, dca_price=dca_price)
-                return f"✅ DCA placed for {symbol} at {dca_price} (qty ~{dca_qty}) with SL {state['sl_price']}."
-            return f"✅ DCA removed for {symbol}."
+            except Exception as e:
+                log.error("DCA order failed for %s: %s", symbol, e)
+                return f"⚠️ Old DCA removed, but placing the new DCA at {dca_price} FAILED: {e}"
+            self.db.upsert(symbol, dca_order_id=dca_order, dca_price=dca_price)
+            return f"✅ DCA placed for {symbol} at {dca_price} (qty ~{dca_qty}) with SL {state['sl_price']}."
 
         elif mod_type == "trail":
             distance = params["distance"]
@@ -1151,8 +1253,13 @@ class TradeManager:
 
         return f"Unknown modification type: {mod_type}"
 
-    def cancel_modification(self, symbol: str) -> str:
+    def cancel_modification(self, symbol: str, token: Optional[str]) -> str:
         with self._lock:
+            mod = self.pending_mods.get(symbol)
+            if not mod:
+                return f"No pending modification for {symbol}."
+            if mod.get("token") != token:
+                return self._stale_card(symbol)
             self.pending_mods.pop(symbol, None)
         return f"Modification for {symbol} cancelled."
 
@@ -1209,5 +1316,6 @@ class TradeManager:
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
             return f"No active position for {symbol}."
-        self.handle_sl_fill(symbol, source="Manual close")
-        return f"✅ {symbol} position closed."
+        if self.handle_sl_fill(symbol, source="Manual close"):
+            return f"✅ {symbol} position closed."
+        return f"⚠️ Closing {symbol} FAILED — the bot keeps retrying. Check Bitunix."

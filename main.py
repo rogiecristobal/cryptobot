@@ -5,6 +5,7 @@ Entrypoint. Runs the Telegram bot (polling) and the Bitunix private WebSocket
 import asyncio
 import logging
 import os
+import platform
 import ssl
 import sys
 import threading
@@ -137,6 +138,12 @@ async def _handle_position_close(symbol: str, trade_manager: TradeManager, db: S
     # Bitunix also pushes size-0 updates for leverage/margin changes. Only a
     # position that actually opened can "close".
     if state and state["status"] == "active" and state.get("position_opened"):
+        # handle_sl_fill market-closes whatever is open, so a size-0 push that
+        # isn't a real close must not reach it. A real close the REST API is
+        # slow to show is picked up by the watchdog instead.
+        if not await asyncio.to_thread(trade_manager.position_gone, symbol):
+            log.warning("Size-0 push for %s but Bitunix still shows the position — not closing it", symbol)
+            return
         source = trade_manager.exchange.recent_trigger(symbol) or "Position close"
         if source == "SL" and state.get("trailing_distance") and state.get("breakeven_moved"):
             source = "Trailing SL"
@@ -164,8 +171,74 @@ async def _handle_position_open(item: dict, trade_manager: TradeManager, db: Sta
         await asyncio.to_thread(trade_manager.handle_entry_or_dca_fill, symbol)
 
 
+_instance_lock_fd = None  # held open for the life of the process
+_LOCK_OFFSET = 1024  # Windows locks a byte past the PID text, so a refused copy can still read the PID
+
+
+def _acquire_instance_lock() -> bool:
+    """
+    One copy per device. Two copies manage the same Bitunix positions, each
+    with its own idea of the SL, and undo each other's changes. The OS frees
+    the lock when the process dies, however it dies.
+    """
+    global _instance_lock_fd
+    path = os.path.join(os.path.dirname(config.DB_PATH), "bot.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            other = os.read(fd, 64).decode(errors="replace").strip() or "unknown"
+        except OSError:
+            other = "unknown"
+        os.close(fd)
+        log.critical("Another copy of the bot is already running on this device (pid %s, lock %s). "
+                     "Stop it first.", other, path)
+        return False
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, f"{os.getpid():<20}\n".encode())  # fixed width: overwrites an older PID fully
+    _instance_lock_fd = fd
+    return True
+
+
+async def _other_copy_polling(seconds: float = 10) -> bool:
+    """
+    Detects a copy on ANOTHER device, which the lock file can't see. Our long
+    poll cuts the other copy's short; when it polls again it cuts ours, and
+    Telegram tells us with a Conflict. Passes no offset, so no update is consumed.
+    """
+    from telegram import Bot
+    from telegram.error import Conflict
+
+    try:
+        async with Bot(config.TELEGRAM_BOT_TOKEN) as bot:
+            deadline = time.monotonic() + seconds
+            while (left := deadline - time.monotonic()) > 1:
+                try:
+                    updates = await bot.get_updates(timeout=int(left))
+                except Conflict as e:
+                    if "terminated by other getUpdates" not in str(e):
+                        raise
+                    await bot.send_message(
+                        chat_id=config.TELEGRAM_CHAT_ID,
+                        text=(f"⛔ A copy of the bot on {platform.node()} refused to start: another copy "
+                              f"is already running. Stop that one first, then start this one again."))
+                    return True
+                if updates:
+                    await asyncio.sleep(1)  # unconsumed updates come back at once; don't spin
+    except Exception as e:
+        log.warning("Could not check Telegram for another running copy: %s", e)
+    return False
+
+
 def _log_startup_diagnostics():
-    import platform
     from importlib import metadata
 
     def ver(pkg):
@@ -174,13 +247,14 @@ def _log_startup_diagnostics():
         except metadata.PackageNotFoundError:
             return "not installed"
 
-    log.info("Python %s on %s (%s)", sys.version.split()[0], platform.platform(), platform.machine())
+    log.info("Python %s on %s (%s), host=%s pid=%s", sys.version.split()[0], platform.platform(),
+             platform.machine(), platform.node(), os.getpid())
     log.info("Libraries: python-telegram-bot=%s requests=%s websocket-client=%s certifi=%s",
              ver("python-telegram-bot"), ver("requests"), ver("websocket-client"), ver("certifi"))
     log.info("CWD=%s  DB=%s", os.getcwd(), config.DB_PATH)
-    log.info("Config: exchange=Bitunix risk=%s%% dca_split=%s leverage=%s margin=%s confirm_timeout=%ss "
-             "breakeven_timeout=%ss watchdog=%ss trailing=%ss",
-             config.RISK_PERCENT, config.DCA_SPLIT_RATIO, config.DEFAULT_LEVERAGE,
+    log.info("Config: exchange=Bitunix risk=%s%% max_risk=%s%% dca_split=%s leverage=%s margin=%s "
+             "confirm_timeout=%ss breakeven_timeout=%ss watchdog=%ss trailing=%ss",
+             config.RISK_PERCENT, config.MAX_RISK_PERCENT, config.DCA_SPLIT_RATIO, config.DEFAULT_LEVERAGE,
              config.DEFAULT_MARGIN_MODE, config.CONFIRM_TIMEOUT_SECONDS, config.BREAKEVEN_TIMEOUT_SECONDS,
              config.WATCHDOG_INTERVAL_SECONDS, config.TRAILING_INTERVAL_SECONDS)
     log.info("System clock: %s (epoch %.0f) — Bitunix rejects requests if this drifts", time.strftime("%Y-%m-%d %H:%M:%S %z"), time.time())
@@ -267,15 +341,24 @@ def _start_trailing_loop(trade_manager: TradeManager):
 
 
 def main():
+    if not _acquire_instance_lock():
+        sys.exit(1)
     _log_startup_diagnostics()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    # Before reconcile(): that already rewrites SLs on Bitunix from this copy's DB.
+    log.info("Checking Telegram for a copy of the bot running on another device (~10s)...")
+    if loop.run_until_complete(_other_copy_polling()):
+        log.critical("Another copy of the bot is already running (on another device) — not starting. "
+                     "Stop that one first.")
+        sys.exit(1)
+
     exchange = BitunixClient()
     db = StateDB()
 
     manager_ref = ManagerRef()
     tg_app = build_app(manager_ref)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
 
     def notify(text: str):
         _fire_and_forget(
@@ -303,10 +386,12 @@ def main():
     def _patched_stage(signal):
         symbol = signal.asset
         result = _original_stage(signal)
+        _, token = result
         async def _expire():
             await asyncio.sleep(config.CONFIRM_TIMEOUT_SECONDS)
             entry = trade_manager.get_pending(symbol)
-            if entry and entry.get("message_id") and time.time() > entry.get("expiry", 0):
+            if (entry and entry.get("token") == token and entry.get("message_id")
+                    and time.time() > entry.get("expiry", 0)):
                 try:
                     await tg_app.bot.edit_message_text(
                         chat_id=entry["chat_id"],

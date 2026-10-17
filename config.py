@@ -23,6 +23,14 @@ RISK_PERCENT = float(os.getenv("RISK_PERCENT", "3.0"))
 if not 0 < RISK_PERCENT <= 100:
     raise RuntimeError(f"RISK_PERCENT must be between 0 and 100, got {RISK_PERCENT}")
 
+# Hard ceiling per trade, whatever RISK_PERCENT, a /place RISK value or
+# Bitunix's minimum order size would otherwise allow.
+MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "5.0"))
+if not 0 < MAX_RISK_PERCENT <= 100:
+    raise RuntimeError(f"MAX_RISK_PERCENT must be between 0 and 100, got {MAX_RISK_PERCENT}")
+if RISK_PERCENT > MAX_RISK_PERCENT:
+    raise RuntimeError(f"RISK_PERCENT {RISK_PERCENT} is above MAX_RISK_PERCENT {MAX_RISK_PERCENT}")
+
 DCA_SPLIT_RATIO = float(os.getenv("DCA_SPLIT_RATIO", "0.5"))
 if not 0 <= DCA_SPLIT_RATIO <= 1:
     raise RuntimeError(f"DCA_SPLIT_RATIO must be between 0 and 1, got {DCA_SPLIT_RATIO}")

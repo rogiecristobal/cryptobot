@@ -20,6 +20,7 @@ Docs: https://www.bitunix.com/api-docs/futures/  (there is no testnet)
 """
 import email.utils
 import functools
+from decimal import Decimal, ROUND_DOWN
 import hashlib
 import json
 import logging
@@ -260,11 +261,16 @@ class BitunixClient:
         return int(self.get_instrument_info(symbol).get("quotePrecision") or 0)
 
     def round_qty(self, symbol: str, qty: float) -> float:
+        """
+        Round DOWN to Bitunix's qty precision, so rounding never adds risk.
+        Below the symbol's minimum it returns the minimum — callers must check
+        the risk of the qty they actually get.
+        """
         symbol = self._norm(symbol)
         decimals = self._qty_decimals(symbol)
         min_qty = _f(self.get_instrument_info(symbol).get("minTradeVolume"))
-        rounded = round(qty, decimals)
-        return max(rounded, min_qty)
+        floored = float(Decimal(repr(qty)).quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_DOWN))
+        return max(floored, min_qty)
 
     def _fmt_qty(self, symbol: str, qty: float) -> str:
         return f"{qty:.{self._qty_decimals(symbol)}f}"

@@ -67,6 +67,9 @@ class StateDB:
             # Bitunix ids of partial TP orders placed by the version that split the
             # position across TPs. Only read now, to cancel any still open.
             ("ALTER TABLE trades ADD COLUMN tp_ladder_ids TEXT", "tp_ladder_ids"),
+            # Set when the bot decided to close the trade (SL, manual close...).
+            # Kept if closing failed, so the watchdog retries it.
+            ("ALTER TABLE trades ADD COLUMN close_reason TEXT", "close_reason"),
         ]
         for sql, col in migrations:
             try:
@@ -77,6 +80,13 @@ class StateDB:
                     pass
                 else:
                     log.warning("Schema migration error for %s: %s", col, e)
+        # 'closing' only lasts while a close runs. Left over at startup means the
+        # bot died mid-close: make the trade active again so it is tracked, and
+        # close_reason makes the watchdog finish the close.
+        cur = self.conn.execute("UPDATE trades SET status='active' WHERE status='closing'")
+        if cur.rowcount:
+            log.warning("%d trade(s) were mid-close when the bot stopped — the watchdog will finish closing them",
+                        cur.rowcount)
         self.conn.commit()
 
     def get(self, symbol: str):

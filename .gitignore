@@ -1,5 +1,6 @@
 .env
 data/*.db*
+data/bot.lock
 logs/*.log
 __pycache__/
 *.pyc
