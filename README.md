@@ -64,7 +64,16 @@ applied automatically on startup — there is nothing to migrate by hand.
 
 ### Update notes (newest first)
 
-- **Leverage picked by price** (this update). No need to type `100x` any more.
+- **TPs in R, breakeven covers fees** (this update). Optional `.env` addition:
+  `BREAKEVEN_OFFSET_PERCENT=0.15` (the default if missing).
+  - TPs can be given as multiples of R, the entry→SL distance, in `/place`
+    and `/tp`: `/place BTC LONG now SL 81000 TP 1R 2R 3R`, `/tp BTC 1.5R 3R`.
+    Prices still work, and can be mixed in: `TP 1R 85000`.
+  - Moving the SL to breakeven (at TP1, or the breakeven button) now puts it
+    0.15% past entry on the profit side, so a stop-out there still pays the
+    fees. Set `BREAKEVEN_OFFSET_PERCENT=0` for the old exactly-at-entry SL.
+    Trades already past breakeven keep their current SL.
+- **Leverage picked by price** (`ac3ec8a`). No need to type `100x` any more.
   - With no `5x` in `/place`, leverage comes from the entry price: 10,000+ →
     100x, 1,000+ → 50x, 100+ → 25x, 1+ → 20x, below 1 → 10x. Bitunix's
     maximum for the coin still applies, and the card shows what was picked
@@ -152,8 +161,20 @@ applied automatically on startup — there is nothing to migrate by hand.
   Bitunix that closes the whole position. It is attached to every opening
   order (market, limit, DCA) like the SL, so it works even if the bot is offline.
   TPs are sorted nearest-first, so their order in the command doesn't matter.
+- **TPs in R**: a TP can be a multiple of R, the distance from entry to the SL
+  (`TP 1R 2R 3R`, `TP 1.5R`, or mixed with prices: `TP 1R 85000`). The card
+  shows the price each one works out to.
+  - Limit entry: R = entry − SL, fixed.
+  - Market entry: priced from the mark price on the card, then re-set from
+    the actual fill price once the order fills (you get a Telegram message).
+  - `/tp` on an open trade: R = fill price − the trade's *original* SL, so a
+    SL already moved to breakeven or trailed doesn't shrink R.
+  - A DCA fill doesn't change R or move the TPs.
 - **Earlier TPs are SL checkpoints**: nothing is closed there. When mark price
-  reaches TP1 the SL moves to entry; at TP2 it moves to TP1, and so on. It
+  reaches TP1 the SL moves to breakeven — `BREAKEVEN_OFFSET_PERCENT` (default
+  0.15%) past entry on the profit side, so a stop-out there still covers the
+  fees (if price is already back inside that gap, it uses the entry itself).
+  At TP2 it moves to TP1, and so on. It
   never loosens an SL, so if the trailing stop is already past that level it
   stays. You get a Telegram message for each checkpoint. Like the trailing
   stop, this is bot-side (checked every `TRAILING_INTERVAL_SECONDS`) and only

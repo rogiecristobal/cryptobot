@@ -179,18 +179,22 @@ class TradeManager:
         except Exception:
             mark = None
         if mark is not None:
-            if signal.position == "LONG":
-                if signal.sl >= mark:
-                    raise ValueError(f"SL {signal.sl} must be below current MarkPrice {mark} for LONG.")
-                for tp in signal.tps:
-                    if tp <= mark:
-                        raise ValueError(f"TP {tp} must be above current MarkPrice {mark} for LONG.")
-            else:
-                if signal.sl <= mark:
-                    raise ValueError(f"SL {signal.sl} must be above current MarkPrice {mark} for SHORT.")
-                for tp in signal.tps:
-                    if tp >= mark:
-                        raise ValueError(f"TP {tp} must be below current MarkPrice {mark} for SHORT.")
+            if signal.position == "LONG" and signal.sl >= mark:
+                raise ValueError(f"SL {signal.sl} must be below current MarkPrice {mark} for LONG.")
+            if signal.position == "SHORT" and signal.sl <= mark:
+                raise ValueError(f"SL {signal.sl} must be above current MarkPrice {mark} for SHORT.")
+
+        # R TPs are priced from the entry; a market entry uses the mark for now
+        # and is re-priced from the fill (_reprice_r_tps).
+        ref_price = signal.entry if not signal.entry_is_market else (mark or self.exchange.get_last_price(symbol))
+        r_prices = self._r_tps(symbol, signal.position, ref_price, signal.sl, signal.tp_r_mults)
+        tps = self._order_tps(signal.position, signal.tps + r_prices)
+        if mark is not None:
+            for tp in tps:
+                if signal.position == "LONG" and tp <= mark:
+                    raise ValueError(f"TP {tp} must be above current MarkPrice {mark} for LONG.")
+                if signal.position == "SHORT" and tp >= mark:
+                    raise ValueError(f"TP {tp} must be below current MarkPrice {mark} for SHORT.")
 
         if signal.margin_percent is not None and signal.margin_percent <= 0:
             raise ValueError(f"RISK must be a positive percentage, got {signal.margin_percent}.")
@@ -207,15 +211,16 @@ class TradeManager:
                 f"Rejected: this trade would risk ${actual_risk:,.2f} ({actual_pct:.2f}% of ${equity:,.2f}), "
                 f"above MAX_RISK_PERCENT {config.MAX_RISK_PERCENT}%.{min_size_note}")
 
-        ref_price = signal.entry if not signal.entry_is_market else (mark or self.exchange.get_last_price(symbol))
         leverage, leverage_why = self._pick_leverage(signal, ref_price)
 
+        r_levels = [[m, p] for m, p in zip(signal.tp_r_mults, r_prices)]
         token = self._new_token()
         with self._lock:
             self.pending[symbol] = {
                 "signal": signal, "expiry": expiry, "token": token,
                 "chat_id": None, "message_id": None,
                 "cached_qty": sizing, "leverage": leverage,
+                "tps": tps, "tp_r_levels": r_levels,
             }
 
         trailing_desc = ""
@@ -237,10 +242,14 @@ class TradeManager:
             warn = "⚠️ " if min_size_note else ""
             lines.append(f"  {warn}Target was {risk_pct}% (${risk_amount:.2f}); sizes are rounded to what "
                          f"Bitunix accepts.{min_size_note}")
-        if signal.tps:
-            lines.append(f"TPs: {', '.join(str(t) for t in signal.tps)}")
-            if len(signal.tps) > 1:
-                lines.append(self._tp_plan_text(len(signal.tps)).strip())
+        if tps:
+            lines.append(f"TPs: {self._tp_list_text(tps, r_levels)}")
+            if r_levels:
+                lines.append(f"  1R = {self._px(symbol, abs(ref_price - signal.sl))}"
+                             + (f" from mark {ref_price:g}; the R TPs are re-set from the fill price"
+                                if signal.entry_is_market else ""))
+            if len(tps) > 1:
+                lines.append(self._tp_plan_text(len(tps)).strip())
         lines.append(f"Leverage: {leverage}x {self._margin_mode(signal)} — {leverage_why}{trailing_desc}")
         return "\n".join(lines), token
 
@@ -363,6 +372,9 @@ class TradeManager:
         side = "BUY" if signal.position == "LONG" else "SELL"
 
         leverage = entry["leverage"]  # chosen when staged, as shown on the card
+        tps = entry["tps"]  # explicit + R-priced, as shown on the card
+        # Only a market entry re-prices its R TPs (from the fill); a limit entry's R is fixed.
+        r_levels = entry["tp_r_levels"] if signal.entry_is_market else []
         self.exchange.set_margin_mode(symbol, self._margin_mode(signal))
         self.exchange.set_leverage(symbol, leverage)
 
@@ -386,7 +398,8 @@ class TradeManager:
             entry_price=signal.entry if not signal.entry_is_market else 0,
             sl_price=signal.sl,
             original_sl_price=signal.sl,
-            tp_prices=self.db.dumps(signal.tps),
+            tp_prices=self.db.dumps(tps),
+            tp_r_levels=self.db.dumps(r_levels) if r_levels else None,
             breakeven_moved=0,
             raw_signal=signal.raw_text or signal.asset,
             dca_price=None,
@@ -400,7 +413,7 @@ class TradeManager:
         # so Bitunix creates its TP/SL order on the fill itself — protection no longer depends on
         # the bot being online and catching the fill event.
         # Entries carry the last TP, which closes the position; earlier TPs are SL checkpoints.
-        tp = signal.tps[-1] if signal.tps else None
+        tp = tps[-1] if tps else None
         try:
             if signal.entry_is_market:
                 entry_order = self.exchange.place_market_order(symbol, side, qty_entry,
@@ -428,7 +441,7 @@ class TradeManager:
 
         entry_desc = "Market" if signal.entry_is_market else "Limit"
         tp_desc = f" & TP {tp}" if tp is not None else ""
-        if len(signal.tps) > 1:
+        if len(tps) > 1:
             tp_desc = f" & final TP {tp} (earlier TPs move the SL)"
         return f"{entry_desc} entry placed for {symbol} with native SL{tp_desc}.{dca_warning}"
 
@@ -473,7 +486,7 @@ class TradeManager:
     # the ones already reached. Only the LAST level is a real TP on Bitunix: it
     # sits on every TP/SL order (and on entry/DCA orders) and closes the whole
     # position. The earlier levels are checkpoints the bot watches on mark
-    # price — nothing is closed there, the SL steps up instead: to entry at the
+    # price — nothing is closed there, the SL steps up instead: to breakeven at the
     # first one, then to the previous checkpoint at each later one.
 
     def _target_tp(self, symbol: str, state: dict) -> Optional[float]:
@@ -496,6 +509,77 @@ class TradeManager:
     def _order_tps(position: str, prices: List[float]) -> List[float]:
         """Nearest TP first: ascending for LONG, descending for SHORT, duplicates dropped."""
         return sorted(set(prices), reverse=(position == "SHORT"))
+
+    def _r_tps(self, symbol: str, position: str, entry: float, sl: float, mults: List[float]) -> List[float]:
+        """TP prices for R multiples: entry ± mult × |entry − SL|, rounded for Bitunix."""
+        if not mults:
+            return []
+        long = position == "LONG"
+        if entry <= 0 or sl <= 0 or ((sl >= entry) if long else (sl <= entry)):
+            raise ValueError(f"Can't price TPs in R: SL {sl} must be {'below' if long else 'above'} entry {entry}.")
+        risk = abs(entry - sl)
+        prices = []
+        for m in mults:
+            p = self.exchange.round_price(symbol, entry + m * risk if long else entry - m * risk)
+            if p <= 0:
+                raise ValueError(f"TP {m:g}R would be at {p} — below zero. Use a smaller R or a price.")
+            prices.append(p)
+        return prices
+
+    @staticmethod
+    def _tp_list_text(tps: List[float], r_levels) -> str:
+        """'71000, 83000 (1R), 85000 (2R)': TP prices, the ones given in R labelled."""
+        labels = {p: f"{p} ({m:g}R)" for m, p in r_levels}
+        return ", ".join(labels.get(t, str(t)) for t in tps)
+
+    def _breakeven_price(self, symbol: str, state: dict, mark: Optional[float] = None) -> float:
+        """
+        Where "SL to breakeven" goes: BREAKEVEN_OFFSET_PERCENT past entry on the
+        profit side, so a stop-out there still covers the fees. Falls back to
+        the entry itself if price is already back inside that offset (Bitunix
+        rejects an SL on the wrong side of mark). 0 if the entry isn't known.
+        """
+        entry = state.get("entry_price") or 0
+        if entry <= 0:
+            return 0
+        long = state["position"] == "LONG"
+        offset = entry * config.BREAKEVEN_OFFSET_PERCENT / 100
+        price = self.exchange.round_price(symbol, entry + offset if long else entry - offset)
+        if mark and ((price >= mark) if long else (price <= mark)):
+            log.info("%s: breakeven %s +fees is past mark %s — using entry %s", symbol, price, mark, entry)
+            return entry
+        return price
+
+    def _reprice_r_tps(self, symbol: str, fill_price: float):
+        """
+        Market entry filled: TPs given in R were priced from the mark when
+        staged. Re-price them from the fill price (R = fill − original SL).
+        The caller syncs Bitunix.
+        """
+        with self._tp_lock:
+            state = self.db.get(symbol)
+            levels = self.db.loads(state.get("tp_r_levels")) if state else []
+            if not levels:
+                return
+            current = self.db.loads(state.get("tp_prices"))
+            # A level reached before this ran (it's in filled_tp_prices now) stays reached.
+            ahead = [(m, p) for m, p in levels if any(self._same_price(p, c) for c in current)]
+            try:
+                new = self._r_tps(symbol, state["position"], fill_price,
+                                  state.get("original_sl_price") or 0, [m for m, _ in ahead])
+            except ValueError as e:
+                log.warning("%s: R TPs not re-priced from fill %s: %s", symbol, fill_price, e)
+                self.db.upsert(symbol, tp_r_levels=None)
+                self.notify(f"⚠️ {symbol}: R TPs kept at their card prices — {e}")
+                return
+            old = [p for _, p in ahead]
+            kept = [c for c in current if not any(self._same_price(c, p) for p in old)]
+            tps = self._order_tps(state["position"], kept + new)
+            self.db.upsert(symbol, tp_prices=self.db.dumps(tps), tp_r_levels=None)
+        if old != new:
+            log.info("%s: R TPs re-priced from fill %s: %s -> %s", symbol, fill_price, old, new)
+            self.notify(f"🎯 {symbol} filled at {fill_price:g} — R TPs re-set from the fill: "
+                        f"{self._tp_list_text(tps, list(zip([m for m, _ in ahead], new)))}")
 
     def _tp_label(self, state: dict, index: int) -> str:
         """'TP3' for index 0 of the remaining levels when two TPs were already reached."""
@@ -622,13 +706,12 @@ class TradeManager:
         hit_labels = [f"{self._tp_label(state, i)} {levels[i]}" for i in hits]
         filled += [levels[i] for i in hits]
 
-        # SL to entry at the first checkpoint, else to the checkpoint before the
-        # latest one; never loosen it (the trailing stop may already be past it).
+        # SL to breakeven (entry + fees) at the first checkpoint, else to the checkpoint
+        # before the latest one; never loosen it (the trailing stop may already be past it).
         is_long = state["position"] == "LONG"
-        entry = state.get("entry_price") or 0
-        target = filled[-2] if len(filled) >= 2 else entry
+        target = filled[-2] if len(filled) >= 2 else self._breakeven_price(symbol, state, mark)
         current = state.get("sl_price") or 0
-        target_name = "entry" if len(filled) < 2 else f"TP{len(filled) - 1}"
+        target_name = "breakeven" if len(filled) < 2 else f"TP{len(filled) - 1}"
         tighter = target > 0 and (current <= 0 or (target > current if is_long else target < current))
         updates = dict(tp_prices=self.db.dumps([lv for i, lv in enumerate(levels) if i not in hits]),
                        filled_tp_prices=self.db.dumps(filled),
@@ -722,14 +805,18 @@ class TradeManager:
         return count
 
     def apply_breakeven(self, symbol: str) -> bool:
-        """Move SL to entry (then arm trailing if configured). Returns True on success."""
+        """Move SL to breakeven, entry + fees (then arm trailing if configured). Returns True on success."""
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
             return False
         if state.get("breakeven_moved"):
             return True
 
-        new_sl = state["entry_price"] or state["original_sl_price"]
+        try:
+            mark = self.exchange.get_mark_price(symbol)
+        except Exception:
+            mark = None
+        new_sl = self._breakeven_price(symbol, state, mark) or state["original_sl_price"]
         self.db.upsert(symbol, sl_price=new_sl, breakeven_moved=1, breakeven_prompt_msg_id=None)
 
         # Always move the fixed SL first: a trailing stop with an activation
@@ -739,9 +826,9 @@ class TradeManager:
         self._activate_trailing_if_needed(symbol)
 
         if ok:
-            self.notify(f"✅ SL moved to entry ({new_sl}) for {symbol}.")
+            self.notify(f"✅ SL moved to breakeven ({new_sl}) for {symbol}.")
         else:
-            self.notify(f"⚠️ Failed to move SL to entry ({new_sl}) for {symbol} — check Bitunix.")
+            self.notify(f"⚠️ Failed to move SL to breakeven ({new_sl}) for {symbol} — check Bitunix.")
         return ok
 
     def clear_breakeven_prompt(self, symbol: str):
@@ -903,6 +990,7 @@ class TradeManager:
                     td = self.exchange.round_price(symbol, risk * r_mult)
                     if td > 0:
                         self.db.upsert(symbol, trailing_distance=td)
+            self._reprice_r_tps(symbol, avg_price)
             # Only check SL breach on the initial entry fill (not DCA fills)
             sl_price = state.get("sl_price", 0)
             pos_side = state.get("position", "")
@@ -1125,7 +1213,7 @@ class TradeManager:
             if not entry:
                 return None
             signal = entry["signal"]
-            fields = {"tps": list(signal.tps), "errors": []}
+            fields = {"tps": list(signal.tps), "tp_r_mults": list(signal.tp_r_mults), "errors": []}
             fields.update(changes)
             return dataclasses.replace(signal, **fields)
 
@@ -1168,19 +1256,35 @@ class TradeManager:
     def _tp_plan_text(n: int) -> str:
         if n <= 1:
             return "  The TP closes the whole position."
-        return (f"  The first {n - 1} TPs only move the SL: to entry at the first, then to the previous TP.\n"
+        return (f"  The first {n - 1} TPs only move the SL: to breakeven (entry + fees) at the first, "
+                f"then to the previous TP.\n"
                 f"  Nothing is closed until the last TP (or the SL).")
 
-    def stage_modify_tp(self, symbol: str, new_prices: List[float]) -> tuple[str, str]:
+    def stage_modify_tp(self, symbol: str, new_prices: List[float],
+                        r_mults: Optional[List[float]] = None) -> tuple[str, str]:
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
             raise ValueError(f"No active position or pending trade for {symbol}.")
 
+        r_levels = []
+        if r_mults:
+            # R from the trade's original entry and SL: a moved SL (breakeven,
+            # trailing) doesn't change what 1R means.
+            entry = state.get("entry_price") or 0
+            if entry <= 0:
+                raise ValueError(f"{symbol}'s market entry hasn't filled yet, so R isn't known. "
+                                 f"Give TP prices, or retry after the fill.")
+            r_prices = self._r_tps(symbol, state["position"], entry, state.get("original_sl_price") or 0, r_mults)
+            r_levels = list(zip(r_mults, r_prices))
+            new_prices = list(new_prices) + r_prices
         self._validate_tps(symbol, state["position"], new_prices)
         new_prices = self._order_tps(state["position"], new_prices)
         old = ", ".join(str(t) for t in self.db.loads(state["tp_prices"])) or "none"
         hit = self.db.loads(state.get("filled_tp_prices"))
-        prompt = f"Modify TPs for {symbol}?\n  Current: {old}\n  New: {', '.join(str(t) for t in new_prices)}"
+        prompt = f"Modify TPs for {symbol}?\n  Current: {old}\n  New: {self._tp_list_text(new_prices, r_levels)}"
+        if r_levels:
+            prompt += (f"\n  1R = {self._px(symbol, abs(entry - state['original_sl_price']))} "
+                       f"(entry {entry:g} − original SL {state['original_sl_price']:g})")
         if hit:
             prompt += f"\n  Already hit (kept): {', '.join(str(t) for t in hit)}"
         prompt += "\n" + self._tp_plan_text(len(new_prices))
@@ -1226,7 +1330,8 @@ class TradeManager:
         elif mod_type == "tp":
             new_prices = self._order_tps(state["position"], params["new_prices"])
             prices = ", ".join(str(t) for t in new_prices)
-            self.db.upsert(symbol, tp_prices=self.db.dumps(new_prices))
+            # New TPs replace any R TPs still waiting to be re-priced from a market fill.
+            self.db.upsert(symbol, tp_prices=self.db.dumps(new_prices), tp_r_levels=None)
             problems, pos = [], None
             try:
                 pos = self.exchange.get_open_position(symbol)

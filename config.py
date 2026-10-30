@@ -78,6 +78,12 @@ BREAKEVEN_TIMEOUT_SECONDS = int(os.getenv("BREAKEVEN_TIMEOUT_SECONDS", "60"))
 if BREAKEVEN_TIMEOUT_SECONDS <= 0:
     raise RuntimeError(f"BREAKEVEN_TIMEOUT_SECONDS must be positive, got {BREAKEVEN_TIMEOUT_SECONDS}")
 
+# Breakeven SL sits this far past entry, on the profit side, so a stop-out
+# there still pays the entry + exit fees (~0.12% round trip at taker rates).
+BREAKEVEN_OFFSET_PERCENT = float(os.getenv("BREAKEVEN_OFFSET_PERCENT", "0.15"))
+if not 0 <= BREAKEVEN_OFFSET_PERCENT <= 5:
+    raise RuntimeError(f"BREAKEVEN_OFFSET_PERCENT must be between 0 and 5, got {BREAKEVEN_OFFSET_PERCENT}")
+
 WATCHDOG_INTERVAL_SECONDS = int(os.getenv("WATCHDOG_INTERVAL_SECONDS", "30"))
 if WATCHDOG_INTERVAL_SECONDS < 5:
     raise RuntimeError(f"WATCHDOG_INTERVAL_SECONDS must be >= 5, got {WATCHDOG_INTERVAL_SECONDS}")

@@ -17,4 +17,5 @@ class ParsedSignal:
     trailing_r_mult: Optional[float] = None    # R multiplier for trailing stop (default 1.0)
     raw_text: str = ""
     tps: List[float] = field(default_factory=list)
+    tp_r_mults: List[float] = field(default_factory=list)  # TPs given as R (TP 1R 2R), priced when staged
     errors: List[str] = field(default_factory=list)

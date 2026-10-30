@@ -29,6 +29,30 @@ def _parse_float(s: str) -> Optional[float]:
     return val if math.isfinite(val) else None  # "nan"/"inf" parse as floats but aren't prices
 
 
+def _parse_r(s: str) -> Optional[float]:
+    """'2R' / '1.5r' -> 1.5: a TP as a multiple of the entry->SL distance. None if not one."""
+    if not s.lower().endswith("r"):
+        return None
+    val = _parse_float(s[:-1])
+    return val if val is not None and val > 0 else None
+
+
+def _parse_tps(tokens: List[str]) -> tuple[List[float], List[float], Optional[str]]:
+    """TP tokens -> (prices, R multiples, first invalid token or None)."""
+    prices, mults = [], []
+    for t in tokens:
+        r = _parse_r(t)
+        p = _parse_float(t) if r is None else None
+        if r is None and p is None:
+            return prices, mults, t
+        (mults if r is not None else prices).append(r if r is not None else p)
+    return prices, mults, None
+
+
+def _tps_text(prices: List[float], mults: List[float]) -> str:
+    return ", ".join([str(p) for p in prices] + [f"{m:g}R" for m in mults])
+
+
 _LABELS = {"sl", "tp", "dca", "risk", "trail"}
 
 
@@ -117,13 +141,15 @@ def build_app(manager_ref):
             await update.message.reply_text(
                 "Usage:\n"
                 "  /place <ASSET> LONG|SHORT <ENTRY|market> SL <SL> [TP <TP1> [TP2 ...]] [DCA <DCA>] [RISK <%>] [LEVERAGEx] [TRAIL [mult]]\n"
+                "  A TP is a price or a multiple of R, the entry→SL distance: TP 1R 2R 1.5R\n"
                 "Examples:\n"
                 "  /place BTC LONG 69000 SL 67000 TP 71000 5x\n"
                 "  /place BTC LONG 69000 SL 67000 5x\n"
                 "  /place ETH LONG 3500 SL 3400 TP 3600 DCA 3450 RISK 5 3x\n"
                 "  /place SOL LONG market SL 140\n"
                 "  /place BTC LONG market SL 67000 TP 71000 TRAIL 2\n"
-                "  /place BTC LONG 69000 SL 67000 TP 71000 72000 73000"
+                "  /place BTC LONG 69000 SL 67000 TP 71000 72000 73000\n"
+                "  /place BTC LONG now SL 81000 TP 1R 2R 3R"
             )
             return
 
@@ -145,6 +171,7 @@ def build_app(manager_ref):
 
         sl = None
         tps: List[float] = []
+        tp_r_mults: List[float] = []
         dca = None
         risk_pct = None
         leverage = None  # not given: picked from LEVERAGE_TIERS by price
@@ -168,6 +195,20 @@ def build_app(manager_ref):
                     trailing_mult = 1.0
                 i += 1
                 continue
+            if label == "tp":
+                # TP takes one or more prices or R multiples: TP 71000 72000 / TP 1R 2R 3R
+                j = i + 1
+                while j < len(rest) and (_parse_float(rest[j]) is not None or _parse_r(rest[j]) is not None):
+                    j += 1
+                prices, mults, _ = _parse_tps(rest[i + 1:j])
+                if not prices and not mults:
+                    await update.message.reply_text(
+                        f"Invalid TP value: {rest[i + 1]}" if j < len(rest) else "Missing value for TP.")
+                    return
+                tps += prices
+                tp_r_mults += mults
+                i = j
+                continue
             if label in _LABELS:
                 if i + 1 >= len(rest):
                     await update.message.reply_text(f"Missing value for {token}.")
@@ -179,12 +220,6 @@ def build_app(manager_ref):
                     return
                 if label == "sl":
                     sl = val
-                elif label == "tp":
-                    # TP takes one or more prices: TP 71000 72000 73000
-                    tps.append(val)
-                    while i + 1 < len(rest) and _parse_float(rest[i + 1]) is not None:
-                        i += 1
-                        tps.append(_parse_float(rest[i]))
                 elif label == "dca":
                     dca = val
                 elif label == "risk":
@@ -219,6 +254,7 @@ def build_app(manager_ref):
             raw_text=update.message.text,
             sl=sl,
             tps=tps,
+            tp_r_mults=tp_r_mults,
             errors=[],
         )
 
@@ -266,22 +302,21 @@ def build_app(manager_ref):
         if len(args) < 2:
             await update.message.reply_text(
                 "Usage: /tp <SYMBOL> <tp1> [tp2 tp3 ...]\n"
+                "Each TP is a price (71000) or a multiple of R, the entry→SL distance (1R, 1.5R).\n"
+                "  /tp BTC 1R 2R 3R\n"
                 "Only the last TP closes the position. Earlier TPs just move the SL:\n"
-                "to entry when price reaches the first, then to the previous TP at each later one."
+                "to breakeven when price reaches the first, then to the previous TP at each later one."
             )
             return
         symbol = args[0].upper()
         if not symbol.endswith("USDT"):
             symbol += "USDT"
-        prices: List[float] = []
-        for a in args[1:]:
-            p = _parse_float(a)
-            if p is None:
-                await update.message.reply_text(f"Invalid price: {a}")
-                return
-            prices.append(p)
-        await _change(update, symbol, f"✏️ TPs changed to {', '.join(str(p) for p in prices)}.",
-                      manager_ref.tm.stage_modify_tp, (prices,), tps=prices)
+        prices, mults, bad = _parse_tps(args[1:])
+        if bad is not None:
+            await update.message.reply_text(f"Invalid TP: {bad} — use a price (71000) or R (1R, 1.5R).")
+            return
+        await _change(update, symbol, f"✏️ TPs changed to {_tps_text(prices, mults)}.",
+                      manager_ref.tm.stage_modify_tp, (prices, mults), tps=prices, tp_r_mults=mults)
 
     async def dca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _authorized(update):
@@ -373,10 +408,11 @@ def build_app(manager_ref):
             "🤖 CryptoBot Commands\n\n"
             "/place <ASSET> LONG|SHORT <ENTRY|market> SL <SL> [options]\n"
             "  Options: TP <p1> [p2 p3] DCA <price> RISK <%> LEVERAGEx\n"
+            "  TPs can be in R (the entry→SL distance): TP 1R 2R 1.5R\n"
             "  Leverage is picked by price if you leave it out (BTC 100x ... under $1 10x)\n"
             "  Example: /place BTC LONG market SL 67000 TP 71000 RISK 3 5x\n\n"
             "/sl <SYMBOL> <price>     \u2014 Modify stop loss\n"
-            "/tp <SYMBOL> <p1> [p2 p3] \u2014 Set TPs (last one closes; earlier ones move SL)\n"
+            "/tp <SYMBOL> <p1|1R> [p2 p3] \u2014 Set TPs (last one closes; earlier ones move SL)\n"
             "/dca <SYMBOL> [price]    \u2014 Add/remove DCA order\n"
             "/entry <SYMBOL> <price>  \u2014 Modify entry (pending only)\n"
             "/trail <SYMBOL> [mult]   \u2014 Set trailing stop (default 1R)\n"
@@ -497,8 +533,8 @@ def build_app(manager_ref):
             ok = await asyncio.to_thread(trade_manager.apply_breakeven, symbol)
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=message_id,
-                text=(f"✅ SL moved to entry for {symbol}." if ok
-                      else f"⚠️ Could not move SL to entry for {symbol} — check Bitunix."),
+                text=(f"✅ SL moved to breakeven (entry + fees) for {symbol}." if ok
+                      else f"⚠️ Could not move SL to breakeven for {symbol} — check Bitunix."),
             )
         elif action == "breakeven_no":
             trade_manager.clear_breakeven_prompt(symbol)

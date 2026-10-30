@@ -55,14 +55,14 @@ async def _handle_manual_tp(symbol: str, trade_manager: TradeManager, tg_app, db
 
     keyboard = [
         [
-            InlineKeyboardButton("✅ Yes — move SL to entry", callback_data=f"breakeven_yes:{symbol}"),
+            InlineKeyboardButton("✅ Yes — move SL to breakeven", callback_data=f"breakeven_yes:{symbol}"),
             InlineKeyboardButton("❌ No", callback_data=f"breakeven_no:{symbol}"),
         ]
     ]
     try:
         msg = await tg_app.bot.send_message(
             chat_id=config.TELEGRAM_CHAT_ID,
-            text=f"🎯 TP1 hit on {symbol}\n\nMove SL to entry price?",
+            text=f"🎯 TP1 hit on {symbol}\n\nMove SL to breakeven (entry + fees)?",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
     except Exception as e:
@@ -76,8 +76,8 @@ async def _handle_manual_tp(symbol: str, trade_manager: TradeManager, tg_app, db
         state = db.get(symbol)
         if state and state.get("breakeven_prompt_msg_id") == msg.message_id:
             ok = await asyncio.to_thread(trade_manager.apply_breakeven, symbol)
-            text = (f"⏱️ Timeout — SL auto-moved to entry for {symbol}." if ok
-                    else f"⏱️ Timeout — tried to move SL to entry for {symbol} but it FAILED. Check Bitunix.")
+            text = (f"⏱️ Timeout — SL auto-moved to breakeven for {symbol}." if ok
+                    else f"⏱️ Timeout — tried to move SL to breakeven for {symbol} but it FAILED. Check Bitunix.")
             try:
                 await tg_app.bot.edit_message_text(
                     chat_id=config.TELEGRAM_CHAT_ID,
@@ -256,10 +256,11 @@ def _log_startup_diagnostics():
         log.warning("DEFAULT_LEVERAGE in .env is no longer used — leverage comes from LEVERAGE_TIERS. "
                     "Delete the line to silence this.")
     log.info("Config: exchange=Bitunix risk=%s%% max_risk=%s%% dca_split=%s leverage_tiers=%s margin=%s "
-             "confirm_timeout=%ss breakeven_timeout=%ss watchdog=%ss trailing=%ss",
+             "confirm_timeout=%ss breakeven_timeout=%ss breakeven_offset=%s%% watchdog=%ss trailing=%ss",
              config.RISK_PERCENT, config.MAX_RISK_PERCENT, config.DCA_SPLIT_RATIO,
              ",".join(f"{p:g}:{lev}" for p, lev in config.LEVERAGE_TIERS),
              config.DEFAULT_MARGIN_MODE, config.CONFIRM_TIMEOUT_SECONDS, config.BREAKEVEN_TIMEOUT_SECONDS,
+             config.BREAKEVEN_OFFSET_PERCENT,
              config.WATCHDOG_INTERVAL_SECONDS, config.TRAILING_INTERVAL_SECONDS)
     log.info("System clock: %s (epoch %.0f) — Bitunix rejects requests if this drifts", time.strftime("%Y-%m-%d %H:%M:%S %z"), time.time())
 

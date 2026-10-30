@@ -70,6 +70,9 @@ class StateDB:
             # Set when the bot decided to close the trade (SL, manual close...).
             # Kept if closing failed, so the watchdog retries it.
             ("ALTER TABLE trades ADD COLUMN close_reason TEXT", "close_reason"),
+            # [[mult, price], ...] for TPs given in R on a market entry: priced from
+            # the mark when staged, re-priced from the fill. Cleared once re-priced.
+            ("ALTER TABLE trades ADD COLUMN tp_r_levels TEXT", "tp_r_levels"),
         ]
         for sql, col in migrations:
             try:
