@@ -337,6 +337,14 @@ class BitunixClient:
         self._post("/api/v1/futures/account/change_leverage",
                    {"symbol": symbol, "marginCoin": MARGIN_COIN, "leverage": int(leverage)})
 
+    def account_margin_mode(self) -> str | None:
+        """None: Bitunix sets the margin mode per symbol (set_margin_mode)."""
+        return None
+
+    def check_account(self) -> list[str]:
+        """Account problems to report at startup. Bitunix's are covered by the generic checks."""
+        return []
+
     def set_margin_mode(self, symbol: str, mode: str):
         symbol = self._norm(symbol)
         target = "ISOLATION" if mode.upper().startswith("ISOLAT") else "CROSS"

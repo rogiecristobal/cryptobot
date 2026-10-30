@@ -13,8 +13,20 @@ def _required(name: str) -> str:
         raise RuntimeError(f"Missing required env var: {name}. Check your .env file.")
     return val
 
-BITUNIX_API_KEY = _required("BITUNIX_API_KEY")
-BITUNIX_API_SECRET = _required("BITUNIX_API_SECRET")
+# Which exchange the bot trades on. One at a time: switching means a restart.
+EXCHANGE = os.getenv("EXCHANGE", "bitunix").strip().lower()
+EXCHANGE_NAMES = {"bitunix": "Bitunix", "bybit": "Bybit"}
+if EXCHANGE not in EXCHANGE_NAMES:
+    raise RuntimeError(f"EXCHANGE must be bitunix or bybit, got {EXCHANGE}")
+EXCHANGE_NAME = EXCHANGE_NAMES[EXCHANGE]
+
+# Only the selected exchange's keys are required.
+if EXCHANGE == "bitunix":
+    BITUNIX_API_KEY = _required("BITUNIX_API_KEY")
+    BITUNIX_API_SECRET = _required("BITUNIX_API_SECRET")
+else:
+    BYBIT_API_KEY = _required("BYBIT_API_KEY")
+    BYBIT_API_SECRET = _required("BYBIT_API_SECRET")
 
 TELEGRAM_BOT_TOKEN = _required("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = int(_required("TELEGRAM_CHAT_ID"))
@@ -94,7 +106,10 @@ TRAILING_INTERVAL_SECONDS = int(os.getenv("TRAILING_INTERVAL_SECONDS", "5"))
 if TRAILING_INTERVAL_SECONDS < 1:
     raise RuntimeError(f"TRAILING_INTERVAL_SECONDS must be >= 1, got {TRAILING_INTERVAL_SECONDS}")
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "trades.db")
+# One trade database per exchange, so trades still open on the other one are
+# picked up again when you switch back. Bitunix keeps the original file name.
+DB_FILES = {"bitunix": "trades.db", "bybit": "trades_bybit.db"}
+DB_PATH = os.path.join(os.path.dirname(__file__), "data", DB_FILES[EXCHANGE])
 
 # SSL: ensure Python's SSL context can find CA certificates.
 # Termux restarts can reset SSL_CERT_FILE, causing HTTPS failures.

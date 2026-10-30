@@ -15,6 +15,7 @@ from signal_parser import ParsedSignal
 import config
 
 log = logging.getLogger("telegram_bot")
+EX = config.EXCHANGE_NAME  # in messages
 
 
 def _authorized(update: Update) -> bool:
@@ -534,7 +535,7 @@ def build_app(manager_ref):
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=message_id,
                 text=(f"✅ SL moved to breakeven (entry + fees) for {symbol}." if ok
-                      else f"⚠️ Could not move SL to breakeven for {symbol} — check Bitunix."),
+                      else f"⚠️ Could not move SL to breakeven for {symbol} — check {EX}."),
             )
         elif action == "breakeven_no":
             trade_manager.clear_breakeven_prompt(symbol)
@@ -577,7 +578,7 @@ def build_app(manager_ref):
                     await context.bot.send_message(
                         chat_id=config.TELEGRAM_CHAT_ID,
                         text=(f"⚠️ Another copy of this bot is running with the same token "
-                              f"(this one: {platform.node()}). Both manage the same Bitunix "
+                              f"(this one: {platform.node()}). Both manage the same {EX} "
                               f"positions and will overwrite each other's SLs. Stop one of them."))
                 except Exception as e:
                     log.warning("Could not send the conflict alert: %s", e)
@@ -591,7 +592,7 @@ def build_app(manager_ref):
         if update.effective_chat and update.effective_chat.id == config.TELEGRAM_CHAT_ID:
             try:
                 await context.bot.send_message(chat_id=config.TELEGRAM_CHAT_ID,
-                                               text=f"⚠️ Something went wrong: {err}\nCheck Bitunix and /status.")
+                                               text=f"⚠️ Something went wrong: {err}\nCheck {EX} and /status.")
             except Exception:
                 pass
 

@@ -4,6 +4,8 @@ which orders belong to which asset, or whether breakeven has already fired.
 """
 import sqlite3
 import json
+import os
+import pathlib
 import logging
 import threading
 import time
@@ -142,6 +144,21 @@ class StateDB:
     def close(self):
         with self.lock:
             self.conn.close()
+
+    @staticmethod
+    def active_symbols_in(path: str) -> list:
+        """Active trades in another trade database (read-only), [] if it doesn't exist or can't be read."""
+        if not os.path.isfile(path):
+            return []
+        try:
+            conn = sqlite3.connect(pathlib.Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                return [r[0] for r in conn.execute("SELECT symbol FROM trades WHERE status='active'")]
+            finally:
+                conn.close()
+        except Exception as e:
+            log.warning("Could not read %s: %s", path, e)
+            return []
 
     @staticmethod
     def dumps(obj) -> str:

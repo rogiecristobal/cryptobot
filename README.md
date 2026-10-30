@@ -1,14 +1,22 @@
-# Bitunix Signal Trading Bot
+# Bitunix / Bybit Signal Trading Bot
 
-Pastes a signal into Telegram → you reply ✅ → bot places entry/DCA on Bitunix (USDT-M futures) →
-auto-manages SL/TP, steps the SL up as price reaches each TP, and cancels everything for
-that asset if SL hits.
+Pastes a signal into Telegram → you reply ✅ → bot places entry/DCA on Bitunix or Bybit
+(USDT perpetual futures) → auto-manages SL/TP, steps the SL up as price reaches each TP,
+and cancels everything for that asset if SL hits.
+
+It trades on one exchange at a time, picked with `EXCHANGE` in `.env` (default
+`bitunix`). This README says "Bitunix" in many places; unless a section says
+otherwise, it works the same on Bybit — see [Using Bybit](#using-bybit) for the
+differences.
 
 ## ⚠️ Before you touch mainnet keys
 
 - The Bitunix client was live-tested with tiny XRP orders (limit + SL, SL
   amend, cancel, market entry with SL/TP, SL move, flash close, WebSocket
   events). Bitunix has **no testnet**, so still start with small sizes.
+- The Bybit client has **not been live-tested yet** — only against a
+  simulation of Bybit's API. Start with the smallest sizes Bybit allows and
+  watch the first trades in the Bybit app.
 - Give the Bitunix API key **futures trade permission only** — never
   withdrawal. If you set an IP whitelist, add the bot's IP.
 - One-way position mode is recommended. Hedge mode also works (verified
@@ -28,6 +36,7 @@ pip install -r requirements.txt --break-system-packages   # Termux
 
 cp .env.example .env
 # fill in BITUNIX_API_KEY, BITUNIX_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# (for Bybit: EXCHANGE=bybit, BYBIT_API_KEY, BYBIT_API_SECRET — see "Using Bybit")
 ```
 
 Get `TELEGRAM_CHAT_ID` by messaging your bot once, then hitting
@@ -37,6 +46,38 @@ Run:
 ```bash
 python3 main.py
 ```
+
+## Using Bybit
+
+1. Bybit needs a **Unified Trading Account** (the default for new accounts; a
+   classic account gets a warning at startup). Create an API key with
+   **Contract — Orders and Positions** (read-write). Never withdrawal.
+2. In `.env`:
+   ```bash
+   EXCHANGE=bybit
+   BYBIT_API_KEY=...
+   BYBIT_API_SECRET=...
+   ```
+3. Restart the bot. The startup messages say which exchange it runs on.
+
+Switching between exchanges:
+- Each exchange has its own trade database (`data/trades.db` for Bitunix,
+  `data/trades_bybit.db` for Bybit). Trades still open on the other exchange
+  keep their SL/TP there, but nothing trails them, steps their SL up or cleans
+  up after them until you switch back. The bot tells you at startup if any are left.
+
+What's different on Bybit:
+- **Margin mode is for the whole account** on Bybit, so the bot uses whatever
+  the account is set to (the card shows it) and never changes it.
+  `DEFAULT_MARGIN_MODE` only applies to Bitunix.
+- **The SL and TP sit on the position itself**: one SL and one TP per
+  position, which Bybit keeps even if the bot is offline. A partial TP/SL you
+  add in the Bybit app is left alone by the bot.
+- **Some coins trade in lots of 1000**: PEPE is `1000PEPEUSDT`, so use
+  `/place 1000PEPE ...`. The bot suggests this when a coin isn't found.
+- Risk is sized on the account's **USDT** wallet balance; other collateral
+  coins aren't counted.
+- Trailing stop and TP checkpoints are bot-side, exactly as on Bitunix.
 
 ## Updating on Termux
 
@@ -64,7 +105,12 @@ applied automatically on startup — there is nothing to migrate by hand.
 
 ### Update notes (newest first)
 
-- **TPs in R, breakeven covers fees** (this update). Optional `.env` addition:
+- **Bybit support** (this update). Nothing to do to stay on Bitunix: with no
+  `EXCHANGE` in `.env` the bot runs on Bitunix as before. To trade on Bybit,
+  see [Using Bybit](#using-bybit).
+  - Fix: `/tp` on a trade with a DCA still waiting to fill now updates the
+    DCA order's TP too. Before, a DCA filling later brought the old TP back.
+- **TPs in R, breakeven covers fees** (`724921b`). Optional `.env` addition:
   `BREAKEVEN_OFFSET_PERCENT=0.15` (the default if missing).
   - TPs can be given as multiples of R, the entry→SL distance, in `/place`
     and `/tp`: `/place BTC LONG now SL 81000 TP 1R 2R 3R`, `/tp BTC 1.5R 3R`.
@@ -226,6 +272,7 @@ applied automatically on startup — there is nothing to migrate by hand.
 | `config.py` | loads `.env`, all tunables in one place |
 | `signal_parser.py` | text → structured signal (same logic as the web formatter) |
 | `bitunix_client.py` | all Bitunix futures REST/WebSocket calls; returns normalized dicts |
+| `bybit_client.py` | the same for Bybit V5 (USDT perpetuals), same interface and dicts |
 | `state_db.py` | SQLite persistence for open trade state |
 | `trade_manager.py` | core lifecycle: stage → confirm → sync protective orders → breakeven → SL-cascade |
 | `telegram_bot.py` | Telegram handlers, chat-ID authorization |

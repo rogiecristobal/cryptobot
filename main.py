@@ -1,5 +1,5 @@
 """
-Entrypoint. Runs the Telegram bot (polling) and the Bitunix private WebSocket
+Entrypoint. Runs the Telegram bot (polling) and the exchange private WebSocket
 (order/position fills) side by side in one process.
 """
 import asyncio
@@ -17,7 +17,6 @@ import urllib3.exceptions
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import config
-from bitunix_client import BitunixClient
 from state_db import StateDB
 from trade_manager import TradeManager
 from telegram_bot import build_app
@@ -28,6 +27,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler("logs/bot.log")],
 )
 log = logging.getLogger("main")
+EX = config.EXCHANGE_NAME  # in messages
 # httpx logs every request URL at INFO, and Telegram URLs contain the bot token.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -77,7 +77,7 @@ async def _handle_manual_tp(symbol: str, trade_manager: TradeManager, tg_app, db
         if state and state.get("breakeven_prompt_msg_id") == msg.message_id:
             ok = await asyncio.to_thread(trade_manager.apply_breakeven, symbol)
             text = (f"⏱️ Timeout — SL auto-moved to breakeven for {symbol}." if ok
-                    else f"⏱️ Timeout — tried to move SL to breakeven for {symbol} but it FAILED. Check Bitunix.")
+                    else f"⏱️ Timeout — tried to move SL to breakeven for {symbol} but it FAILED. Check {EX}.")
             try:
                 await tg_app.bot.edit_message_text(
                     chat_id=config.TELEGRAM_CHAT_ID,
@@ -95,7 +95,7 @@ FILL_STATUSES = ("FILLED", "PART_FILLED", "PART_FILLED_CANCELED")
 
 async def _handle_fill_async(item: dict, state: dict | None, trade_manager: TradeManager, tg_app, db: StateDB):
     """Async wrapper for fill handling, offloads blocking work via to_thread.
-    item is a normalized order event from BitunixClient."""
+    item is a normalized order event from the exchange client."""
     symbol = item["symbol"]
     status = item["status"]
     order_id = item["order_id"]
@@ -142,7 +142,7 @@ async def _handle_position_close(symbol: str, trade_manager: TradeManager, db: S
         # isn't a real close must not reach it. A real close the REST API is
         # slow to show is picked up by the watchdog instead.
         if not await asyncio.to_thread(trade_manager.position_gone, symbol):
-            log.warning("Size-0 push for %s but Bitunix still shows the position — not closing it", symbol)
+            log.warning(f"Size-0 push for %s but {EX} still shows the position — not closing it", symbol)
             return
         source = trade_manager.exchange.recent_trigger(symbol) or "Position close"
         if source == "SL" and state.get("trailing_distance") and state.get("breakeven_moved"):
@@ -155,7 +155,7 @@ _last_position_sync = {}
 
 async def _handle_position_open(item: dict, trade_manager: TradeManager, db: StateDB):
     """Backup path for SL: a position that opened (or grew) runs the fill
-    handler, even if the order event was missed. Bitunix position pushes
+    handler, even if the order event was missed. Position pushes
     don't include the SL, so the handler checks it over REST."""
     symbol = item["symbol"]
     now = time.time()
@@ -177,7 +177,7 @@ _LOCK_OFFSET = 1024  # Windows locks a byte past the PID text, so a refused copy
 
 def _acquire_instance_lock() -> bool:
     """
-    One copy per device. Two copies manage the same Bitunix positions, each
+    One copy per device. Two copies manage the same exchange positions, each
     with its own idea of the SL, and undo each other's changes. The OS frees
     the lock when the process dies, however it dies.
     """
@@ -252,58 +252,90 @@ def _log_startup_diagnostics():
     log.info("Libraries: python-telegram-bot=%s requests=%s websocket-client=%s certifi=%s",
              ver("python-telegram-bot"), ver("requests"), ver("websocket-client"), ver("certifi"))
     log.info("CWD=%s  DB=%s", os.getcwd(), config.DB_PATH)
+    log.info("Exchange: %s (EXCHANGE=%s in .env)", EX, config.EXCHANGE)
     if os.getenv("DEFAULT_LEVERAGE"):
         log.warning("DEFAULT_LEVERAGE in .env is no longer used — leverage comes from LEVERAGE_TIERS. "
                     "Delete the line to silence this.")
-    log.info("Config: exchange=Bitunix risk=%s%% max_risk=%s%% dca_split=%s leverage_tiers=%s margin=%s "
+    log.info(f"Config: exchange={EX} risk=%s%% max_risk=%s%% dca_split=%s leverage_tiers=%s margin=%s "
              "confirm_timeout=%ss breakeven_timeout=%ss breakeven_offset=%s%% watchdog=%ss trailing=%ss",
              config.RISK_PERCENT, config.MAX_RISK_PERCENT, config.DCA_SPLIT_RATIO,
              ",".join(f"{p:g}:{lev}" for p, lev in config.LEVERAGE_TIERS),
              config.DEFAULT_MARGIN_MODE, config.CONFIRM_TIMEOUT_SECONDS, config.BREAKEVEN_TIMEOUT_SECONDS,
              config.BREAKEVEN_OFFSET_PERCENT,
              config.WATCHDOG_INTERVAL_SECONDS, config.TRAILING_INTERVAL_SECONDS)
-    log.info("System clock: %s (epoch %.0f) — Bitunix rejects requests if this drifts", time.strftime("%Y-%m-%d %H:%M:%S %z"), time.time())
+    log.info(f"System clock: %s (epoch %.0f) — {EX} rejects requests if this drifts", time.strftime("%Y-%m-%d %H:%M:%S %z"), time.time())
 
 
-def _log_exchange_diagnostics(exchange: BitunixClient, notify):
-    """Account-side state that explains most Bitunix failures: clock drift, position mode, API access."""
+def _log_exchange_diagnostics(exchange, notify):
+    """Account-side state that explains most exchange failures: clock drift, position mode, API access."""
     drift = exchange.clock_drift_seconds()
     if drift is not None:
-        log.info("Clock drift vs Bitunix: %+.1fs", drift)
+        log.info(f"Clock drift vs {EX}: %+.1fs", drift)
         if abs(drift) > 5:
-            log.warning("Clock drift %.1fs — signed requests may be rejected (error 10007). Sync the device clock.", drift)
-            notify(f"⚠️ Device clock is {drift:+.0f}s off Bitunix time — orders may be rejected. Sync the clock.")
+            log.warning("Clock drift %.1fs — signed requests may be rejected. Sync the device clock.", drift)
+            notify(f"⚠️ Device clock is {drift:+.0f}s off {EX} time — orders may be rejected. Sync the clock.")
     try:
+        for problem in exchange.check_account():
+            log.error("%s", problem)
+            notify(f"⚠️ {problem}")
         mode = exchange.get_position_mode()
         wallet = exchange.get_wallet_info()
-        log.info("Bitunix account: position_mode=%s balance=%.2f available=%.2f upnl=%.2f",
+        log.info(f"{EX} account: position_mode=%s balance=%.2f available=%.2f upnl=%.2f",
                  mode, wallet["equity"], wallet["available"], wallet["unrealized_pnl"])
         if mode != "ONE_WAY":
             # Verified live: in hedge mode closing orders still use the opposite side,
             # so fill routing works. Only holding a long AND a short on one symbol breaks it.
-            log.warning("Bitunix position mode is %s — fine as long as each symbol is held in one direction", mode)
+            log.warning(f"{EX} position mode is %s — fine as long as each symbol is held in one direction", mode)
     except Exception as e:
-        log.error("Bitunix account check failed: %s", e)
-        notify(f"⚠️ Could not read the Bitunix account: {e}\nCheck the API key, its permissions and IP whitelist.")
+        log.error(f"{EX} account check failed: %s", e)
+        notify(f"⚠️ Could not read the {EX} account: {e}\nCheck the API key, its permissions and IP whitelist.")
 
 
-def _start_watchdog(exchange: BitunixClient, trade_manager: TradeManager, notify):
-    """Background thread: re-checks every trade against Bitunix and revives a dead WebSocket."""
+def _make_exchange():
+    """The client for EXCHANGE in .env. Both expose the same interface (see bitunix_client.py)."""
+    if config.EXCHANGE == "bybit":
+        from bybit_client import BybitClient
+        return BybitClient()
+    from bitunix_client import BitunixClient
+    return BitunixClient()
+
+
+def _warn_other_exchange_trades(notify):
+    """
+    Trades still open on the exchange the bot is NOT running on keep their
+    SL/TP there, but nothing trails them, steps up their SL or cleans up
+    after them until the bot runs on that exchange again.
+    """
+    for name, filename in config.DB_FILES.items():
+        if name == config.EXCHANGE:
+            continue
+        path = os.path.join(os.path.dirname(config.DB_PATH), filename)
+        symbols = StateDB.active_symbols_in(path)
+        if symbols:
+            other = config.EXCHANGE_NAMES[name]
+            log.warning("%d %s trade(s) still open and NOT managed: %s", len(symbols), other, symbols)
+            notify(f"⚠️ {len(symbols)} {other} trade(s) still tracked ({', '.join(symbols)}) but the bot now runs "
+                   f"on {EX}. Their SL/TP stay on {other}, but no trailing, SL step-ups or cleanup until "
+                   f"you switch back (EXCHANGE={name}).")
+
+
+def _start_watchdog(exchange, trade_manager: TradeManager, notify):
+    """Background thread: re-checks every trade against the exchange and revives a dead WebSocket."""
     ws_down_since = [None]
     last_down_notice = [0.0]
     restarting = threading.Event()
 
     def restart_ws():
         try:
-            log.warning("Restarting Bitunix private WebSocket...")
+            log.warning(f"Restarting {EX} private WebSocket...")
             exchange.restart_private_ws()  # waits up to 30s for the login
             if exchange.ws_is_healthy():
-                log.info("Bitunix private WebSocket restarted")
+                log.info(f"{EX} private WebSocket restarted")
                 if last_down_notice[0]:
-                    notify("🔌 Bitunix connection restored. Positions re-checked.")
+                    notify(f"🔌 {EX} connection restored. Positions re-checked.")
                     last_down_notice[0] = 0.0
             else:
-                log.warning("Bitunix private WebSocket restarted but not logged in yet (%s)",
+                log.warning(f"{EX} private WebSocket restarted but not logged in yet (%s)",
                             exchange.ws_login_error or "no login reply")
             trade_manager.ensure_protection()
         except Exception as e:
@@ -319,14 +351,14 @@ def _start_watchdog(exchange: BitunixClient, trade_manager: TradeManager, notify
                     ws_down_since[0] = None
                 elif ws_down_since[0] is None:
                     ws_down_since[0] = time.time()
-                    log.warning("Bitunix private WebSocket is down")
+                    log.warning(f"{EX} private WebSocket is down")
                 elif time.time() - ws_down_since[0] > 60 and not restarting.is_set():
                     # Reconnect every minute, but alert at most every 10 min.
                     if time.time() - last_down_notice[0] > 600:
-                        reason = (f"\nBitunix rejected the login: {exchange.ws_login_error}\n"
+                        reason = (f"\n{EX} rejected the login: {exchange.ws_login_error}\n"
                                   f"Check the API key and the device clock."
                                   if exchange.ws_login_error else "")
-                        notify("⚠️ Bitunix live connection was down >60s — fills may have been missed. "
+                        notify(f"⚠️ {EX} live connection was down >60s — fills may have been missed. "
                                "Reconnecting; watchdog keeps checking SLs meanwhile." + reason)
                         last_down_notice[0] = time.time()
                     ws_down_since[0] = time.time()
@@ -341,7 +373,7 @@ def _start_watchdog(exchange: BitunixClient, trade_manager: TradeManager, notify
 
 
 def _start_trailing_loop(trade_manager: TradeManager):
-    """Background thread: bot-side trailing stop and TP checkpoints (Bitunix has neither)."""
+    """Background thread: bot-side trailing stop and TP checkpoints (exchange-native ones aren't used)."""
     def run():
         while True:
             time.sleep(config.TRAILING_INTERVAL_SECONDS)
@@ -372,7 +404,7 @@ def main():
                      "Stop that one first.")
         sys.exit(1)
 
-    exchange = BitunixClient()
+    exchange = _make_exchange()
     db = StateDB()
 
     manager_ref = ManagerRef()
@@ -423,6 +455,7 @@ def main():
     trade_manager.stage_signal = _patched_stage
 
     _log_exchange_diagnostics(exchange, notify)
+    _warn_other_exchange_trades(notify)
 
     # These run on the Bitunix WebSocket thread and receive one normalized
     # event each (see bitunix_client.py). They must never raise.
@@ -461,7 +494,7 @@ def main():
     exchange.start_private_ws(on_order=on_order_update, on_position=on_position_update)
     _start_watchdog(exchange, trade_manager, notify)
     _start_trailing_loop(trade_manager)
-    log.info("Bitunix private WebSocket connected. Starting Telegram polling...")
+    log.info(f"{EX} private WebSocket connected. Starting Telegram polling...")
     try:
         tg_app.run_polling(bootstrap_retries=-1)
     except KeyboardInterrupt:
