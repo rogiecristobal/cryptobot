@@ -580,6 +580,16 @@ class BybitClient:
             log.info("%s: TP %s -> %s", symbol, raw.get("takeProfit") or "none", tp_str)
         return changed
 
+    def remove_position_sl(self, symbol: str) -> int:
+        """Take the SL off the open position (its TP stays). Returns 1 if one was removed, else 0."""
+        symbol = self._norm(symbol)
+        raw = self._raw_position(symbol)
+        if not raw or _f(raw.get("stopLoss")) <= 0:
+            return 0
+        self._trading_stop(symbol, raw, stopLoss="0")  # 0 cancels the SL
+        log.info("%s: SL %s removed", symbol, raw.get("stopLoss"))
+        return 1
+
     def cancel_tpsl(self, symbol: str, order_id: str):
         self._post("/v5/order/cancel", {"category": CATEGORY, "symbol": self._norm(symbol), "orderId": str(order_id)})
 

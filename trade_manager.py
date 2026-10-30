@@ -22,6 +22,8 @@ ALERT_COOLDOWN_SECONDS = 600
 # entry order vanished (orders are placed right after the state is written).
 NEW_TRADE_GRACE_SECONDS = 120
 EX = config.EXCHANGE_NAME  # in messages
+# How often to remind about a trade whose SL was removed with /sl <symbol> none.
+SL_REMOVED_REMINDER_SECONDS = 1800
 
 
 class TradeManager:
@@ -78,6 +80,10 @@ class TradeManager:
                      symbol, actual_size, pos["avg_price"], pos["sl_prices"], state.get("sl_price"),
                      pos["tp_prices"], state.get("tp_prices"),
                      state.get("trailing_distance"), state.get("breakeven_moved"))
+            if self._sl_removed(state):
+                self.sync_protective_orders(symbol)  # TP only
+                return (f"⚠️ {symbol}: reconciled (size {actual_size}) — it has NO stop loss "
+                        f"(removed with /sl). Set one with /sl {symbol} <price>.")
             synced = False
             if state.get("sl_price"):
                 synced = self.sync_protective_orders(symbol)
@@ -595,7 +601,7 @@ class TradeManager:
         so a later fill doesn't re-arm a stale SL or TP on the position.
         Returns a description of each order that could not be amended."""
         ours = {state.get("entry_order_id"), state.get("dca_order_id")} - {None, ""}
-        if not ours:
+        if not ours or not sl_price or sl_price <= 0:  # never amend an order's SL away
             return []
         problems = []
         for order in self.exchange.get_open_orders(symbol):
@@ -722,6 +728,7 @@ class TradeManager:
                        breakeven_moved=1, breakeven_prompt_msg_id=None)
         if tighter:
             updates["sl_price"] = target
+            updates["sl_removed"] = 0  # a removed SL comes back at the checkpoint
         self.db.upsert(symbol, **updates)
         log.info("%s: %s reached (mark %s) — SL %s -> %s", symbol, ", ".join(hit_labels), mark, current,
                  target if tighter else f"{current} (kept, already tighter than {target_name})")
@@ -751,6 +758,12 @@ class TradeManager:
                 state = self.db.get(symbol)  # SL may have stepped up
         except Exception as e:
             log.warning("TP checkpoint check failed for %s: %s", symbol, e)
+        if self._sl_removed(state):
+            # No SL on purpose (/sl <symbol> none): keep the TP in place, add no SL.
+            position = self.exchange.get_open_position(symbol)
+            if position:
+                self._sync_tps_and_alert(symbol, position)
+            return True
         raw_sl = state.get("sl_price") or 0
         if raw_sl <= 0:
             log.warning("%s has no SL on record — nothing to sync", symbol)
@@ -916,7 +929,13 @@ class TradeManager:
         trailing = bool(state.get("trailing_distance") and state.get("breakeven_moved"))
         sl = state.get("sl_price") or 0
         tps = self.db.loads(state.get("tp_prices"))
-        if tps and sl > 0 and min(abs(fill_price - t) for t in tps) < abs(fill_price - sl):
+        if sl <= 0:
+            # No SL to compare with (removed): a TP if it closed nearer the TP than the entry.
+            entry = state.get("entry_price") or 0
+            if tps and abs(fill_price - tps[-1]) < abs(fill_price - entry):
+                return "TP"
+            return "Position close"
+        if tps and min(abs(fill_price - t) for t in tps) < abs(fill_price - sl):
             return "TP"
         return "Trailing SL" if trailing else "SL"
 
@@ -1077,6 +1096,14 @@ class TradeManager:
 
     def _check_sl(self, symbol: str, state: dict, pos: dict) -> bool:
         """Watchdog SL check. Returns True if it resynced (which also resyncs the TP)."""
+        if self._sl_removed(state):
+            # Removed on purpose: remind, never put it back. An SL added in the app is left alone.
+            if pos["stop_loss"] <= 0:
+                self._alert(f"sl_removed:{symbol}",
+                            f"⚠️ Reminder: {symbol} has NO stop loss — its loss isn't capped. "
+                            f"Put one back with /sl {symbol} <price>.",
+                            every=SL_REMOVED_REMINDER_SECONDS)
+            return False
         sl = state.get("sl_price") or 0
         if pos["stop_loss"] > 0:
             if sl <= 0:
@@ -1238,9 +1265,68 @@ class TradeManager:
             if state["position"] == "SHORT" and new_sl <= mark:
                 raise ValueError(f"For SHORT, SL {new_sl} must be above current mark price {mark}.")
 
-        old_sl = state["sl_price"]
+        old_sl = "none (removed)" if self._sl_removed(state) else state["sl_price"]
         prompt = f"Modify SL for {symbol}?\n  Current: {old_sl}\n  New: {new_sl}"
         return prompt, self._stage_mod(symbol, "sl", {"new_price": new_sl})
+
+    def _sl_removed(self, state: dict) -> bool:
+        """The trade has no SL on purpose (/sl <symbol> none), not by mistake."""
+        return bool(state.get("sl_removed")) and not (state.get("sl_price") or 0) > 0
+
+    def stage_remove_sl(self, symbol: str) -> tuple[str, str]:
+        state = self.db.get(symbol)
+        if not state or state["status"] != "active" or not state.get("position_opened"):
+            raise ValueError(f"No open {symbol} position. /sl {symbol} none only works on a trade that has "
+                             f"filled — new trades always need an SL.")
+        if self._sl_removed(state):
+            raise ValueError(f"{symbol} already has no stop loss. Put one back with /sl {symbol} <price>.")
+        # An unfilled entry/DCA order carries the SL with it and would bring it back on fill.
+        ours = {state.get("entry_order_id"), state.get("dca_order_id")} - {None, ""}
+        if any(o["order_id"] in ours for o in self.exchange.get_open_orders(symbol)):
+            raise ValueError(f"{symbol} still has an unfilled DCA/entry order, which would put the SL back when it "
+                             f"fills. Remove it first with /dca {symbol} remove.")
+
+        pos = self.exchange.get_open_position(symbol)
+        sl = state.get("sl_price") or 0
+        lines = [f"⚠️ REMOVE the stop loss on {symbol}?",
+                 f"  Current SL: {sl}"]
+        if pos and sl > 0:
+            lines.append(f"  Loss at that SL now: ~${pos['size'] * abs(pos['avg_price'] - sl):,.2f}")
+        lines.append("  After: NO stop loss. The loss is no longer capped — only liquidation stops it.")
+        if self._margin_mode(ParsedSignal()) == "CROSS":
+            lines.append("  On cross margin, a big move can take more than this trade's margin.")
+        else:
+            lines.append("  On isolated margin, it can lose this trade's whole margin.")
+        if state.get("trailing_distance"):
+            lines.append("  Trailing stop will be switched off.")
+        if len(self.db.loads(state.get("tp_prices"))) > 1:
+            lines.append("  The next TP checkpoint still puts an SL back (breakeven / previous TP).")
+        lines.append(f"  Reminder every {SL_REMOVED_REMINDER_SECONDS // 60} min. Put it back any time: "
+                     f"/sl {symbol} <price>")
+        return "\n".join(lines), self._stage_mod(symbol, "sl_remove", {})
+
+    def _remove_sl(self, symbol: str, state: dict) -> str:
+        self.db.upsert(symbol, sl_price=0, sl_removed=1,
+                       trailing_distance=None, trailing_r_mult=None, trailing_peak=None)
+        # Start the reminder clock now: the confirmation is the first reminder.
+        with self._lock:
+            self._last_alert[f"sl_removed:{symbol}"] = time.time()
+        try:
+            self.exchange.remove_position_sl(symbol)
+            pos = self.exchange.get_open_position(symbol)
+            if pos:
+                self._sync_tps_and_alert(symbol, pos)  # Bitunix cancels the TP with the SL order
+                pos = self.exchange.get_open_position(symbol)
+        except Exception as e:
+            log.error("Removing SL on %s failed: %s", symbol, e)
+            return (f"⚠️ {symbol}: the bot no longer keeps an SL, but {EX} did NOT remove the current one: {e}\n"
+                    f"It stays until you remove it in the {EX} app, or set a new one with /sl {symbol} <price>.")
+        if pos and pos["sl_prices"]:
+            return (f"⚠️ {symbol}: the bot no longer keeps an SL, but {EX} still shows SL "
+                    f"{', '.join(str(p) for p in pos['sl_prices'])}. Check the {EX} app.")
+        log.warning("%s: SL removed on request — position has no stop loss", symbol)
+        return (f"✅ SL removed for {symbol}. ⚠️ It has NO stop loss now — its loss isn't capped.\n"
+                f"Reminder every {SL_REMOVED_REMINDER_SECONDS // 60} min. Put one back with /sl {symbol} <price>.")
 
     def _validate_tps(self, symbol: str, position: str, prices: List[float]):
         """The exchange rejects a TP on the wrong side of mark — catch it before the user confirms."""
@@ -1325,11 +1411,14 @@ class TradeManager:
         if mod_type == "sl":
             if state.get("trailing_distance"):
                 self.db.upsert(symbol, trailing_distance=None, trailing_r_mult=None, trailing_peak=None)
-            self.db.upsert(symbol, sl_price=params["new_price"])
+            self.db.upsert(symbol, sl_price=params["new_price"], sl_removed=0)
             if self.sync_protective_orders(symbol):
                 return f"✅ SL updated for {symbol} to {params['new_price']}."
             return (f"⚠️ SL for {symbol} saved as {params['new_price']} but {EX} did NOT accept it — "
                     f"the old SL may still be active. Check {EX}.")
+
+        elif mod_type == "sl_remove":
+            return self._remove_sl(symbol, state)
 
         elif mod_type == "tp":
             new_prices = self._order_tps(state["position"], params["new_prices"])
@@ -1445,7 +1534,7 @@ class TradeManager:
             leverage = pos["leverage"]
             pnl = pos["unrealized_pnl"]
             pnl_pct = (pnl / max(entry * qty / leverage, 1e-8)) * 100 if entry > 0 else 0
-            sl = state["sl_price"]
+            sl = "NONE ⚠️" if self._sl_removed(state) else state["sl_price"]
             tp_hit = self.db.loads(state.get("filled_tp_prices"))
             tp_raw = self.db.loads(state.get("tp_prices"))
             tps = ", ".join([f"{t} ✓" for t in tp_hit] + [str(t) for t in tp_raw]) or "none"

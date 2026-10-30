@@ -75,6 +75,9 @@ class StateDB:
             # [[mult, price], ...] for TPs given in R on a market entry: priced from
             # the mark when staged, re-priced from the fill. Cleared once re-priced.
             ("ALTER TABLE trades ADD COLUMN tp_r_levels TEXT", "tp_r_levels"),
+            # 1 after /sl <symbol> none: no SL on purpose, so the watchdog reminds
+            # instead of putting one back. Only means something while sl_price is 0.
+            ("ALTER TABLE trades ADD COLUMN sl_removed INTEGER DEFAULT 0", "sl_removed"),
         ]
         for sql, col in migrations:
             try:

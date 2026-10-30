@@ -105,7 +105,9 @@ applied automatically on startup — there is nothing to migrate by hand.
 
 ### Update notes (newest first)
 
-- **Bybit support** (this update). Nothing to do to stay on Bitunix: with no
+- **`/sl <SYMBOL> none` removes the SL** (this update). No `.env` change.
+  See "Removing the SL" under How it behaves before using it.
+- **Bybit support** (`539eb5a`). Nothing to do to stay on Bitunix: with no
   `EXCHANGE` in `.env` the bot runs on Bitunix as before. To trade on Bybit,
   see [Using Bybit](#using-bybit).
   - Fix: `/tp` on a trade with a DCA still waiting to fill now updates the
@@ -194,6 +196,18 @@ applied automatically on startup — there is nothing to migrate by hand.
 - Before you confirm, `/sl`, `/tp`, `/dca` or `/entry` on that symbol sends a
   fresh card with the change, re-checked and re-sized, and retires the old one.
 - No stop loss detected in the signal → **hard rejected**, no trade placed, no exceptions.
+- **Removing the SL**: `/sl BTC none` (also `remove` / `off`) takes the SL off a
+  trade that has already filled, after a confirmation card. Its loss is then
+  **not capped** — only liquidation stops it, and on cross margin that can
+  take more than the trade's margin.
+  - Refused before the entry fills, and while a DCA order is still waiting
+    (it would bring the SL back on fill): `/dca BTC remove` first.
+  - Trailing is switched off. The TP stays and is still enforced.
+  - The watchdog doesn't put the SL back; it reminds you in Telegram every
+    30 min instead. `/status` shows `SL: NONE ⚠️`.
+  - The SL comes back with `/sl BTC <price>`, or by itself when price
+    reaches the next TP checkpoint (breakeven at TP1, then the previous TP).
+  - If the bot is offline, the position has no protection at all.
 - If a DCA level is present, position size is split between the entry order
   and the DCA order per `DCA_SPLIT_RATIO` (default 0.5 = 50/50), sized so that
   if *both* fill, your total risk still lands near your target `RISK_PERCENT`.

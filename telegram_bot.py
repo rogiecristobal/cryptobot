@@ -284,11 +284,16 @@ def build_app(manager_ref):
             return
         args = context.args
         if len(args) < 2:
-            await update.message.reply_text("Usage: /sl <SYMBOL> <new_price>")
+            await update.message.reply_text("Usage: /sl <SYMBOL> <new_price>\n"
+                                            "       /sl <SYMBOL> none  — remove the SL of an open trade")
             return
         symbol = args[0].upper()
         if not symbol.endswith("USDT"):
             symbol += "USDT"
+        if args[1].lower() in ("none", "remove", "off"):
+            # Only an open trade: a card waiting for Confirm can't lose its SL.
+            await _stage_modification(update, manager_ref.tm, manager_ref.tm.stage_remove_sl, symbol)
+            return
         price = _parse_float(args[1])
         if price is None:
             await update.message.reply_text(f"Invalid price: {args[1]}")
@@ -413,6 +418,7 @@ def build_app(manager_ref):
             "  Leverage is picked by price if you leave it out (BTC 100x ... under $1 10x)\n"
             "  Example: /place BTC LONG market SL 67000 TP 71000 RISK 3 5x\n\n"
             "/sl <SYMBOL> <price>     \u2014 Modify stop loss\n"
+            "/sl <SYMBOL> none       \u2014 Remove the SL (open trade; loss not capped!)\n"
             "/tp <SYMBOL> <p1|1R> [p2 p3] \u2014 Set TPs (last one closes; earlier ones move SL)\n"
             "/dca <SYMBOL> [price]    \u2014 Add/remove DCA order\n"
             "/entry <SYMBOL> <price>  \u2014 Modify entry (pending only)\n"

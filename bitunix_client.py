@@ -645,6 +645,22 @@ class BitunixClient:
             log.info("%s: placed position TP at %s (size %s)", symbol, tp_str, size)
         return changed
 
+    def remove_position_sl(self, symbol: str) -> int:
+        """
+        Take every SL off the open position. A TP/SL order that holds the SL is
+        cancelled whole, TP included: the caller puts the TP back with
+        set_position_tp. Returns how many orders were cancelled; raises on failure.
+        """
+        symbol = self._norm(symbol)
+        raw = next((p for p in self._raw_positions(symbol) if p.get("symbol") == symbol), None)
+        if not raw:
+            return 0
+        sl_orders = self._sl_orders(self.get_tpsl_orders(symbol, str(raw["positionId"])))
+        for o in sl_orders:
+            self.cancel_tpsl(symbol, o.get("id") or o.get("orderId"))
+            log.info("%s: cancelled TP/SL order %s to remove SL %s", symbol, o.get("id"), o.get("slPrice"))
+        return len(sl_orders)
+
     def cancel_tpsl(self, symbol: str, order_id: str):
         self._post("/api/v1/futures/tpsl/cancel_order", {"symbol": self._norm(symbol), "orderId": str(order_id)})
 
