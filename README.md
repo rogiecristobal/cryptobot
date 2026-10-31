@@ -105,7 +105,12 @@ applied automatically on startup — there is nothing to migrate by hand.
 
 ### Update notes (newest first)
 
-- **`/sl <SYMBOL> none` removes the SL** (this update). No `.env` change.
+- **Reducing a position in the app no longer closes all of it** (this
+  update). No `.env` change. Before, any market reduce made in the
+  Bitunix/Bybit app was taken for the SL firing and the bot closed the rest.
+  Now the rest stays open with its SL and TP. See "Partial closes" under Known
+  simplifications.
+- **`/sl <SYMBOL> none` removes the SL** (`41d3f83`). No `.env` change.
   See "Removing the SL" under How it behaves before using it.
 - **Bybit support** (`539eb5a`). Nothing to do to stay on Bitunix: with no
   `EXCHANGE` in `.env` the bot runs on Bitunix as before. To trade on Bybit,
@@ -270,8 +275,11 @@ applied automatically on startup — there is nothing to migrate by hand.
   a long and a short on the same symbol would confuse it.
 - **TP vs SL labels**: Bitunix fill events don't say which trigger fired, so a
   close is labelled from the TP/SL push, or by which price it landed closest to.
-- **Partial closes you make in the Bitunix app** look like an SL chunk firing:
-  the bot closes the rest of the position. Use `/close` instead.
+- **Partial closes you make in the Bitunix app** (a market reduce, or a partial
+  TP/SL you added there) are kept: the rest stays open with its SL and TP, and
+  you get a "✂️ reduced" message. A closing market fill only closes the whole
+  trade when the position is gone, or price is at the bot's SL or last TP (an
+  SL that fired for part of the position — the rest is then closed too).
 - **Attached TP/SL**: on fill, Bitunix turns the SL (and TP) attached to an
   entry into separate TP/SL orders sized to that fill. Moving the SL updates
   all of them; the watchdog tops up coverage if any part of the position has

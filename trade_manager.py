@@ -984,6 +984,49 @@ class TradeManager:
         self.notify(f"🛑 {source} triggered on {symbol} — position closed.")
         return True
 
+    def _exit_level_reached(self, state: dict, price: float) -> bool:
+        """price is at/past the trade's SL or last TP — where the bot's own orders close it."""
+        if not price:
+            return False
+        long = state["position"] == "LONG"
+        sl = state.get("sl_price") or 0
+        if sl > 0 and (price <= sl if long else price >= sl):
+            return True
+        tps = self.db.loads(state.get("tp_prices"))
+        return bool(tps) and self._reached(state["position"], price, tps[-1])
+
+    def handle_close_fill(self, symbol: str, fill_price: float, fill_qty: float = 0) -> bool:
+        """
+        A closing market fill on a tracked trade. The bot's SL or TP firing
+        closes the trade out (handle_sl_fill also market-closes a residual
+        left by an SL order that covered only part of the position). A reduce
+        made in the exchange app, or a partial TP/SL added there, closes only
+        part: the rest stays open with its SL/TP. Returns True if closed out.
+        """
+        state = self.db.get(symbol)
+        if not state or state["status"] != "active":
+            return False
+        time.sleep(1)  # the REST position can lag the fill event
+        pos = self.exchange.get_open_position(symbol)
+        if not pos and not self.position_gone(symbol):
+            pos = self.exchange.get_open_position(symbol)
+        if pos and pos["size"] > 0:
+            try:
+                mark = self.exchange.get_mark_price(symbol)
+            except Exception:
+                mark = None
+            if not (self._exit_level_reached(state, fill_price) or self._exit_level_reached(state, mark)):
+                log.info("%s: partial close of %s at %s (mark %s, SL %s, TPs %s) — %s still open, kept",
+                         symbol, fill_qty, fill_price, mark, state.get("sl_price"), state.get("tp_prices"),
+                         pos["size"])
+                self.notify(f"✂️ {symbol} reduced by {fill_qty:g} at {fill_price:g} — {pos['size']:g} still "
+                            f"open and kept, with its SL and TP. Use /close {symbol} to close the rest.")
+                self.sync_protective_orders(symbol)
+                return False
+            log.warning("%s: closing fill at %s (mark %s) reached SL/TP but %s is still open — closing the rest",
+                        symbol, fill_price, mark, pos["size"])
+        return self.handle_sl_fill(symbol, self.classify_exit(symbol, fill_price))
+
     def handle_entry_or_dca_fill(self, symbol: str):
         state = self.db.get(symbol)
         if not state or state["status"] != "active":
