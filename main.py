@@ -6,7 +6,9 @@ import asyncio
 import logging
 import os
 import platform
+import shutil
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -390,10 +392,38 @@ def _start_trailing_loop(trade_manager: TradeManager):
     log.info("Trailing loop started (every %ss)", config.TRAILING_INTERVAL_SECONDS)
 
 
+def _termux_wake_lock():
+    """Keep Android from suspending the process (Termux only; a no-op elsewhere)."""
+    if not shutil.which("termux-wake-lock"):
+        return
+    try:
+        subprocess.run(["termux-wake-lock"], timeout=15)
+        log.info("termux-wake-lock acquired")
+    except Exception as e:
+        log.warning("termux-wake-lock failed: %s", e)
+
+
+def _start_se_worker(tg_app, notify):
+    """
+    Sweep & Engulf strategy worker (se/): its own thread, state, log and
+    restart loop. Any failure here is logged and never stops this bot.
+    """
+    try:
+        from se import worker as se_worker, telegram_cmds as se_telegram
+        worker = se_worker.start(notify)
+        if worker:
+            se_telegram.register(tg_app, worker)
+            log.info("S&E worker started (see logs/se.log)")
+    except Exception as e:
+        log.exception("S&E worker failed to start")
+        notify(f"[S&E] ⚠️ Worker failed to start: {e}. The rest of the bot is unaffected.")
+
+
 def main():
     if not _acquire_instance_lock():
         sys.exit(1)
     _log_startup_diagnostics()
+    _termux_wake_lock()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -494,6 +524,7 @@ def main():
     exchange.start_private_ws(on_order=on_order_update, on_position=on_position_update)
     _start_watchdog(exchange, trade_manager, notify)
     _start_trailing_loop(trade_manager)
+    _start_se_worker(tg_app, notify)
     log.info(f"{EX} private WebSocket connected. Starting Telegram polling...")
     try:
         tg_app.run_polling(bootstrap_retries=-1)

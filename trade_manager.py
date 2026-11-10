@@ -129,8 +129,17 @@ class TradeManager:
             norm = s.replace("/", "").replace(" ", "")
             db_by_norm[norm] = s
 
+        # Positions the S&E strategy worker opened belong to it (it keeps their
+        # SL/TP itself) — never adopt them as orphans.
+        from se.config import STATE_DB_PATH as SE_DB
+        from se.store import live_owned_symbols
+        se_owned = set(live_owned_symbols(SE_DB))
+
         for pos in exchange_positions:
             b_sym = pos["symbol"]
+            if b_sym in se_owned and b_sym not in db_by_norm:
+                log.info("Reconcile: %s position belongs to the S&E worker — left to it", b_sym)
+                continue
             if b_sym not in db_by_norm:
                 side = pos["side"]
                 size = pos["size"]

@@ -125,9 +125,14 @@ class BitunixClient:
     WS_STALE_SECONDS = 60
     WS_MAX_BACKOFF = 30
 
-    def __init__(self):
-        self.api_key = config.BITUNIX_API_KEY
-        self.api_secret = config.BITUNIX_API_SECRET
+    def __init__(self, api_key: str | None = None, api_secret: str | None = None):
+        # Keys can be passed in (the S&E worker does, so it also runs when
+        # EXCHANGE=bybit); by default they come from config as before.
+        self.api_key = api_key if api_key is not None else config.BITUNIX_API_KEY
+        self.api_secret = api_secret if api_secret is not None else config.BITUNIX_API_SECRET
+        # Added to the local clock in signed requests (server time - local time).
+        # 0 keeps the old behaviour; the S&E worker keeps it measured.
+        self.time_offset_ms = 0
         self.session = requests.Session()
         self.session.verify = config.SSL_CA_PATH
         self.timeout = 30
@@ -157,7 +162,7 @@ class BitunixClient:
         headers = {"Content-Type": "application/json", "language": "en-US"}
         if auth:
             nonce = uuid.uuid4().hex
-            timestamp = str(int(time.time() * 1000))
+            timestamp = str(int(time.time() * 1000) + self.time_offset_ms)
             query = "".join(f"{k}{params[k]}" for k in sorted(params))
             digest = _sha256(nonce + timestamp + self.api_key + query + body_str)
             headers.update({

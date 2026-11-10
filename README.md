@@ -79,6 +79,69 @@ What's different on Bybit:
   coins aren't counted.
 - Trailing stop and TP checkpoints are bot-side, exactly as on Bitunix.
 
+## Sweep & Engulf strategy worker (`se/`)
+
+An automatic 4h strategy that runs **inside this bot** (same `python3 main.py`,
+same Telegram bot) and trades BTCUSDT, ETHUSDT and SOLUSDT on Bitunix from its
+own budget (`SE_BUDGET_USDT`, default $100). Every message starts with `[S&E]`.
+It has its own settings (`SE_*` in `.env`), state (`data/se_state.db`) and log
+(`logs/se.log`, rotated at 5 MB, 3 kept).
+
+**Rules** (from the backtest; see `se/strategy.py`): on a closed 4h candle,
+low < previous low (sweep), close > previous high (engulf), previous candle
+green (`SE_PREV_CANDLE_MODE`), close > EMA200. Long only. SL = close − ATR14
+(or the candle low), TP = close + 4R. Market entry within a minute of the
+close; skipped if more than 15 min late. Exits only at the TP or SL. Size =
+3% of strategy equity at risk, capped by free cash like a spot account (on a
+$100 budget the cap usually applies: "sized down"). After 2 losing trades in
+a row, no new trades until the next UTC day.
+
+**Turn it on / off**
+- On by default in paper mode: add the `SE_*` lines from `.env.example` to
+  `.env` (all optional) and restart. Turn it off with `SE_ENABLED=false`.
+- `/se_pause` stops new entries, `/se_resume` allows them again. A file named
+  `STOP` in the bot folder (`touch STOP`, `rm STOP`) also stops new entries.
+  Open trades keep their SL/TP either way.
+
+**Paper → live**
+1. Run in paper for a while and check `/se_status`, `/se_trades`.
+2. In `.env`: `SE_LIVE_CONFIRM=I_ACCEPT_THE_RISK`, then restart the bot.
+3. In Telegram: `/se_mode live` and tap the confirm button.
+   `/se_mode paper` switches back. Paper and live keep separate P&L.
+
+**Live trading details**
+- Margin mode and leverage are set exactly like `/place` (`DEFAULT_MARGIN_MODE`,
+  `LEVERAGE_TIERS`); leverage only changes the margin locked, not the size.
+- The SL and TP are attached to the entry order (like `/place`), checked on
+  Bitunix within 10 s, re-placed if missing, and the position is closed at
+  market (with an alert) if they can't be placed.
+- Bitunix merges trades on one symbol into one position, so the worker owns
+  BTC/ETH/SOL: it skips a signal (and tells you) if any position or order it
+  didn't create is on that coin. `/place` on those coins is refused while S&E
+  holds them, and the existing bot never adopts S&E positions at startup.
+- Every order has a client ID `se_<SYMBOL>_<candle time>`, so a restart or a
+  timed-out request can't place a second order for the same signal.
+- Every 5 minutes it reconciles with Bitunix and re-places a missing SL/TP.
+- `/se_close <coin|all>` closes S&E positions at market after a confirm.
+
+**Commands**: `/se_status`, `/se_trades [n]`, `/se_pause`, `/se_resume`,
+`/se_close <coin|all>`, `/se_mode paper|live`, `/se_help`.
+
+**Replay** (no API keys needed):
+```bash
+python3 -m se.replay --symbol BTCUSDT --from 2025-01-01
+python3 -m se.replay --symbol ETHUSDT --from 2025-01-01 --equity 10000 --fee-pct 0
+```
+Bitunix futures prices differ slightly from Binance spot, so expect small
+differences from TradingView.
+
+**Tests**: `python3 -m unittest discover -s tests -v`
+
+**Termux 24/7**: the bot runs `termux-wake-lock` at startup. Also turn off
+battery optimisation for Termux (Android Settings → Apps → Termux → Battery →
+Unrestricted). A Termux:Boot script that runs `python3 main.py` keeps working
+— the worker needs no second process.
+
 ## Updating on Termux
 
 `git pull` updates the code, but **not `.env`**: it is gitignored, so any
@@ -105,8 +168,11 @@ applied automatically on startup — there is nothing to migrate by hand.
 
 ### Update notes (newest first)
 
-- **Reducing a position in the app no longer closes all of it** (this
-  update). No `.env` change. Before, any market reduce made in the
+- **Sweep & Engulf strategy worker** (this update). Optional `.env`
+  additions: the `SE_*` block from `.env.example` (all have defaults). It
+  starts in **paper** mode by itself — set `SE_ENABLED=false` if you don't want
+  it. No new packages. See [Sweep & Engulf](#sweep--engulf-strategy-worker-se).
+- **Reducing a position in the app no longer closes all of it** (`f0f00d4`). No `.env` change. Before, any market reduce made in the
   Bitunix/Bybit app was taken for the SL firing and the bot closed the rest.
   Now the rest stays open with its SL and TP. See "Partial closes" under Known
   simplifications.
