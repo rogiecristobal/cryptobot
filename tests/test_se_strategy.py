@@ -276,6 +276,39 @@ class TestReferenceCheck(unittest.TestCase):
         self.assertEqual(round(t.r, 2), D("2.00"))
 
 
+class TestShortSide(unittest.TestCase):
+    """Shorts exist for the replay only. Mirror the reference trade: p -> 200 - p."""
+
+    def mirrored(self):
+        return candles([(200 - o, 200 - l, 200 - h, 200 - c) for o, h, l, c in TestReferenceCheck.ROWS])
+
+    def test_mirrored_reference_trade(self):
+        c = cfg(prev_candle_mode="three_in_a_row", ema_filter=False, sl_mode="candle", rr=D("2"),
+                risk_pct=D("2"), daily_loss_limit=0, direction="both")
+        r = s.backtest(self.mirrored(), c, start_equity=D(10000), fee_pct=D(0))
+        self.assertEqual(len(r.trades), 1)
+        t = r.trades[0]
+        self.assertEqual(t.signal.side, "SHORT")
+        self.assertEqual(t.signal.index, 3)
+        self.assertEqual((t.entry, t.signal.sl, t.signal.tp), (D("96.4"), D("99.2"), D("90.8")))
+        self.assertEqual(t.reason, "TP")
+        self.assertEqual(round(t.pnl, 2), D("400.00"))
+        self.assertEqual(round(t.r, 2), D("2.00"))
+
+    def test_long_only_ignores_shorts(self):
+        c = cfg(prev_candle_mode="three_in_a_row", ema_filter=False, sl_mode="candle", rr=D("2"),
+                daily_loss_limit=0, direction="long")
+        self.assertEqual(s.backtest(self.mirrored(), c, D(10000), D(0)).trades, [])
+
+    def test_short_paper_exits(self):
+        c = Candle(t=0, o=D(100), h=D(111), l=D(89), c=D(100))
+        self.assertEqual(s.paper_exit(c, D(110), D(90), side="SHORT"), ("SL", D(110)))  # tie -> SL
+        c = Candle(t=0, o=D(93), h=D(111), l=D(89), c=D(100))
+        self.assertEqual(s.paper_exit(c, D(110), D(90), side="SHORT"), ("TP", D(90)))   # TP nearer open
+        c = Candle(t=0, o=D(112), h=D(113), l=D(105), c=D(106))
+        self.assertEqual(s.paper_exit(c, D(110), D(90), side="SHORT"), ("SL", D(112)))  # opens past SL
+
+
 class TestCandleClock(unittest.TestCase):
     def test_last_closed(self):
         t0 = 1_767_225_600_000  # 00:00 UTC

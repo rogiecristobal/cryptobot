@@ -70,8 +70,8 @@ class SEConfig:
     ema_length: int = 200
     sl_mode: str = "atr"                     # atr | candle
     atr_length: int = 14
-    atr_mult: Decimal = Decimal("1.0")
-    rr: Decimal = Decimal("4.0")
+    atr_mult: Decimal = Decimal("3.0")
+    rr: Decimal = Decimal("3.0")
     direction: str = "long"                  # long only
     daily_loss_limit: int = 2                # losses in a row; 0 = off
     min_order_usdt: Decimal = Decimal("10")
@@ -143,8 +143,8 @@ def load() -> SEConfig:
         ema_length=_int("SE_EMA_LENGTH", 200),
         sl_mode=_str("SE_SL_MODE", "atr").lower(),
         atr_length=_int("SE_ATR_LENGTH", 14),
-        atr_mult=_dec("SE_ATR_MULT", "1.0"),
-        rr=_dec("SE_RR", "4.0"),
+        atr_mult=_dec("SE_ATR_MULT", "3.0"),
+        rr=_dec("SE_RR", "3.0"),
         direction=_str("SE_DIRECTION", "long").lower(),
         daily_loss_limit=_int("SE_DAILY_LOSS_LIMIT", 2),
         min_order_usdt=_dec("SE_MIN_ORDER_USDT", "10"),

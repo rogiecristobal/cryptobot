@@ -40,9 +40,29 @@ def main(argv=None):
     ap.add_argument("--equity", type=Decimal, help="starting equity (default SE_BUDGET_USDT)")
     ap.add_argument("--fee-pct", type=Decimal, help="fee per side in %% (default SE_FEE_PCT)")
     ap.add_argument("--no-rounding", action="store_true", help="don't round qty/prices to Bitunix steps")
+    # Overrides for testing other settings (default: the SE_* values in .env).
+    ap.add_argument("--direction", choices=("long", "short", "both"),
+                    help="replay only — the live worker always trades long only")
+    ap.add_argument("--ema-length", type=int)
+    ap.add_argument("--no-ema-filter", action="store_true")
+    ap.add_argument("--atr-length", type=int)
+    ap.add_argument("--atr-mult", type=Decimal, help="ATR SL multiplier")
+    ap.add_argument("--rr", type=Decimal)
+    ap.add_argument("--sl-mode", choices=se_config.SL_MODES)
+    ap.add_argument("--prev-candle-mode", choices=se_config.PREV_CANDLE_MODES)
+    ap.add_argument("--risk-pct", type=Decimal)
+    ap.add_argument("--daily-loss-limit", type=int)
     args = ap.parse_args(argv)
 
     cfg = se_config.load()
+    overrides = {k: v for k, v in dict(direction=args.direction, ema_length=args.ema_length,
+                                       atr_length=args.atr_length, atr_mult=args.atr_mult, rr=args.rr,
+                                       sl_mode=args.sl_mode, prev_candle_mode=args.prev_candle_mode,
+                                       risk_pct=args.risk_pct, daily_loss_limit=args.daily_loss_limit).items()
+                 if v is not None}
+    if args.no_ema_filter:
+        overrides["ema_filter"] = False
+    cfg = s.with_overrides(cfg, **overrides)
     symbol = args.symbol.upper()
     if not symbol.endswith("USDT"):
         symbol += "USDT"
@@ -66,22 +86,22 @@ def main(argv=None):
 
     print(f"Sweep & Engulf replay — {symbol} 4h, Bitunix last-price candles {_t(candles[0].t)} .. "
           f"{_t(candles[-1].t)} UTC ({len(candles)} candles; signals from {args.date_from})")
-    print(f"Settings: {cfg.summary()}")
+    print(f"Settings: {cfg.summary()} | direction {cfg.direction}")
     print(f"Start equity ${equity}, fee {fee_pct}% per side, "
           + ("no rounding" if args.no_rounding else
              f"price step {inst['price_step']}, qty step {inst['qty_step']}, min qty {inst['min_qty']}"))
     print()
-    hdr = (f"{'#':>3}  {'signal candle':16}  {'entry time':16}  {'entry':>11}  {'SL':>11}  {'TP':>11}  "
+    hdr = (f"{'#':>3}  {'side':5}  {'signal candle':16}  {'entry time':16}  {'entry':>11}  {'SL':>11}  {'TP':>11}  "
            f"{'qty':>10}  {'exit time':16}  {'exit':>11}  {'why':4}  {'P&L $':>10}  {'R':>6}  {'equity':>10}")
     print(hdr)
     print("-" * len(hdr))
     for n, t in enumerate(r.trades, 1):
         sd = "*" if t.sized_down else " "
         if t.reason == "OPEN":
-            print(f"{n:>3}  {_t(t.signal.candle_time):16}  {_t(t.entry_time):16}  {t.entry:>11}  "
+            print(f"{n:>3}  {t.signal.side:5}  {_t(t.signal.candle_time):16}  {_t(t.entry_time):16}  {t.entry:>11}  "
                   f"{t.signal.sl:>11}  {t.signal.tp:>11}  {t.qty:>9}{sd}  {'(still open)':16}")
             continue
-        print(f"{n:>3}  {_t(t.signal.candle_time):16}  {_t(t.entry_time):16}  {t.entry:>11}  {t.signal.sl:>11}  "
+        print(f"{n:>3}  {t.signal.side:5}  {_t(t.signal.candle_time):16}  {_t(t.entry_time):16}  {t.entry:>11}  {t.signal.sl:>11}  "
               f"{t.signal.tp:>11}  {t.qty:>9}{sd}  {_t(t.exit_time):16}  {t.exit:>11}  {t.reason:4}  "
               f"{t.pnl:>10.2f}  {t.r:>6.2f}  {t.equity_after:>10.2f}")
     closed = [t for t in r.trades if t.reason in ("TP", "SL")]
@@ -90,6 +110,12 @@ def main(argv=None):
     print(f"Trades {len(closed)} closed (+{len(r.trades) - len(closed)} open) | wins {wins} | "
           f"losses {len(closed) - wins} | win rate {wins / len(closed) * 100 if closed else 0:.1f}% | "
           f"net P&L ${r.equity - equity:,.2f} | final equity ${r.equity:,.2f}")
+    for side in ("LONG", "SHORT"):
+        st = [t for t in closed if t.signal.side == side]
+        if st:
+            w = sum(1 for t in st if t.pnl > 0)
+            print(f"  {side:5}: {len(st)} trades | wins {w} | win rate {w / len(st) * 100:.1f}% | "
+                  f"P&L ${sum((t.pnl for t in st), Decimal(0)):,.2f}")
     if r.skipped:
         print(f"Skipped signals: {len(r.skipped)}")
         for sig, why in r.skipped:

@@ -89,8 +89,8 @@ It has its own settings (`SE_*` in `.env`), state (`data/se_state.db`) and log
 
 **Rules** (from the backtest; see `se/strategy.py`): on a closed 4h candle,
 low < previous low (sweep), close > previous high (engulf), previous candle
-green (`SE_PREV_CANDLE_MODE`), close > EMA200. Long only. SL = close − ATR14
-(or the candle low), TP = close + 4R. Market entry within a minute of the
+green (`SE_PREV_CANDLE_MODE`), close > EMA200. Long only. SL = close − 3 × ATR14
+(or the candle low), TP = close + 3R. Market entry within a minute of the
 close; skipped if more than 15 min late. Exits only at the TP or SL. Size =
 3% of strategy equity at risk, capped by free cash like a spot account (on a
 $100 budget the cap usually applies: "sized down"). After 2 losing trades in
@@ -131,7 +131,13 @@ a row, no new trades until the next UTC day.
 ```bash
 python3 -m se.replay --symbol BTCUSDT --from 2025-01-01
 python3 -m se.replay --symbol ETHUSDT --from 2025-01-01 --equity 10000 --fee-pct 0
+python3 -m se.replay --symbol SOLUSDT --from 2025-01-01 --atr-mult 2 --rr 4 --direction both
 ```
+Settings can be overridden per run: `--direction long|short|both`,
+`--atr-mult`, `--rr`, `--ema-length`, `--atr-length`, `--sl-mode`,
+`--prev-candle-mode`, `--risk-pct`, `--daily-loss-limit`, `--no-ema-filter`.
+Shorts (the mirror-image rules) exist **only in the replay** — the live
+worker never opens a short.
 Bitunix futures prices differ slightly from Binance spot, so expect small
 differences from TradingView.
 
@@ -168,7 +174,12 @@ applied automatically on startup — there is nothing to migrate by hand.
 
 ### Update notes (newest first)
 
-- **Sweep & Engulf strategy worker** (this update). Optional `.env`
+- **S&E: SL 3 × ATR, R/R 3, replay options and shorts** (this update).
+  The worker's defaults are now `SE_ATR_MULT=3.0` and `SE_RR=3.0`. If your
+  `.env` has older `SE_ATR_MULT` / `SE_RR` lines, change or delete them.
+  The replay takes setting overrides and `--direction both` (shorts are
+  replay-only; live stays long only).
+- **Sweep & Engulf strategy worker** (`b7ff9b1`). Optional `.env`
   additions: the `SE_*` block from `.env.example` (all have defaults). It
   starts in **paper** mode by itself — set `SE_ENABLED=false` if you don't want
   it. No new packages. See [Sweep & Engulf](#sweep--engulf-strategy-worker-se).

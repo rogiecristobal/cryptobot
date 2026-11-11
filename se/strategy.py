@@ -118,7 +118,69 @@ class Signal:
     atr: Optional[Decimal]
     sl: Decimal               # rounded to the price step
     tp: Decimal               # rounded to the price step
-    risk_dist: Decimal        # close - SL (rounded SL): the 1R distance used for sizing
+    risk_dist: Decimal        # |close - SL| (rounded SL): the 1R distance used for sizing
+    side: str = "LONG"        # LONG | SHORT (shorts: replay/backtest only, never traded live)
+
+
+def find_signal(candles: List[Candle], i: int, ema_vals, atr_vals, cfg,
+                price_step: Optional[Decimal] = None, direction: str = "long") -> Optional[Signal]:
+    """The signal on candle i for direction long | short | both. Long and short
+    can't both fire on one candle (close can't be above the previous high
+    and below the previous low)."""
+    if direction in ("long", "both"):
+        sig = check_signal(candles, i, ema_vals, atr_vals, cfg, price_step)
+        if sig:
+            return sig
+    if direction in ("short", "both"):
+        return check_short_signal(candles, i, ema_vals, atr_vals, cfg, price_step)
+    return None
+
+
+def check_short_signal(candles: List[Candle], i: int, ema_vals, atr_vals, cfg,
+                       price_step: Optional[Decimal] = None) -> Optional[Signal]:
+    """
+    Mirror image of check_signal, for the backtest/replay only (the live
+    worker is long only): high[i] > high[i-1], close[i] < low[i-1], previous
+    candle(s) red, close < EMA; SL = close + ATR x mult (or the candle high),
+    TP = close - rr x risk.
+    """
+    if i < 1 or i >= len(candles):
+        return None
+    cur, prev = candles[i], candles[i - 1]
+    if not cur.h > prev.h:          # 1. sweep of the previous high
+        return None
+    if not cur.c < prev.l:          # 2. engulf: close below the previous low
+        return None
+    mode = cfg.prev_candle_mode     # 3. previous candle filter (red)
+    if mode == "same":
+        if not prev.c < prev.o:
+            return None
+    elif mode == "three_in_a_row":
+        if i < 2 or not all(c.c < c.o for c in (candles[i - 2], prev, cur)):
+            return None
+    elif mode != "mixed":
+        raise ValueError(f"unknown prev_candle_mode {mode}")
+    ema_i = ema_vals[i] if ema_vals else None
+    if cfg.ema_filter:              # 4. trend filter: below the EMA
+        if ema_i is None or not cur.c < ema_i:
+            return None
+    atr_i = atr_vals[i] if atr_vals else None
+    if cfg.sl_mode == "atr":
+        if atr_i is None:
+            return None
+        sl_raw = cur.c + atr_i * cfg.atr_mult
+    elif cfg.sl_mode == "candle":
+        sl_raw = cur.h
+    else:
+        raise ValueError(f"unknown sl_mode {cfg.sl_mode}")
+    tp_raw = cur.c - cfg.rr * (sl_raw - cur.c)
+    sl = round_to_step(sl_raw, price_step)
+    tp = round_to_step(tp_raw, price_step)
+    risk_dist = sl - cur.c
+    if tp <= 0 or risk_dist <= 0 or tp >= cur.c:
+        return None
+    return Signal(index=i, candle_time=cur.t, close=cur.c, ema=ema_i, atr=atr_i,
+                  sl=sl, tp=tp, risk_dist=risk_dist, side="SHORT")
 
 
 def check_signal(candles: List[Candle], i: int, ema_vals, atr_vals, cfg,
@@ -274,15 +336,30 @@ def losses_today(state: LossState, now_ms: int) -> int:
 # ---------- paper exits ----------
 
 def paper_exit(candle: Candle, sl: Decimal, tp: Decimal,
-               open_price: Optional[Decimal] = None) -> Optional[Tuple[str, Decimal]]:
+               open_price: Optional[Decimal] = None, side: str = "LONG") -> Optional[Tuple[str, Decimal]]:
     """
-    Did this candle close the long trade? Returns ("SL"|"TP", exit price) or None.
+    Did this candle close the trade? Returns ("SL"|"TP", exit price) or None.
     - A candle that opens beyond a level exits at that open.
     - If one candle touches both, the level closer to the candle's open counts
       as hit first (a tie counts as the SL).
     open_price overrides the candle's open, for the candle the entry filled in.
+    side SHORT mirrors it (SL above, TP below).
     """
     o = candle.o if open_price is None else open_price
+    if side == "SHORT":
+        if o >= sl:
+            return "SL", o
+        if o <= tp:
+            return "TP", o
+        hit_sl = candle.h >= sl
+        hit_tp = candle.l <= tp
+        if hit_sl and hit_tp:
+            return ("SL", sl) if (sl - o) <= (o - tp) else ("TP", tp)
+        if hit_sl:
+            return "SL", sl
+        if hit_tp:
+            return "TP", tp
+        return None
     if o <= sl:
         return "SL", o
     if o >= tp:
@@ -357,11 +434,13 @@ def backtest(candles: List[Candle], cfg, start_equity: Decimal, fee_pct: Decimal
                                         sized_down=sz.sized_down, entry_fee=fee(cd.o, sz.qty, fee_pct))
         # Exit check.
         if pos is not None:
+            side = pos.signal.side
             hit = paper_exit(cd, pos.signal.sl, pos.signal.tp,
-                             open_price=pos.entry if cd.t == pos.entry_time else None)
+                             open_price=pos.entry if cd.t == pos.entry_time else None, side=side)
             if hit:
                 reason, price = hit
-                pnl = (price - pos.entry) * pos.qty - pos.entry_fee - fee(price, pos.qty, fee_pct)
+                move = (pos.entry - price) if side == "SHORT" else (price - pos.entry)
+                pnl = move * pos.qty - pos.entry_fee - fee(price, pos.qty, fee_pct)
                 result.equity += pnl
                 pos.exit_time, pos.exit, pos.reason, pos.pnl = cd.t, price, reason, pnl
                 pos.r = r_multiple(pnl, pos.signal.risk_dist, pos.qty)
@@ -371,7 +450,8 @@ def backtest(candles: List[Candle], cfg, start_equity: Decimal, fee_pct: Decimal
                 pos = None
         # New signal on this (closed) candle, only when flat with nothing pending.
         if pos is None and pending is None:
-            sig = check_signal(candles, j, ema_vals, atr_vals, cfg, price_step)
+            sig = find_signal(candles, j, ema_vals, atr_vals, cfg, price_step,
+                              direction=getattr(cfg, "direction", "long"))
             if sig and (from_ms is None or cd.t >= from_ms):
                 if j + 1 < len(candles):
                     pending = sig
